@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -56,13 +57,12 @@ type DB interface {
 type DBOptions struct {
 	// Clean specifies whether to start with a clean database or download data from cloud storage and start with backed up data.
 	Clean bool
-	// LocalPath is the path where local db files will be stored.
+	// LocalPath is the path where local db files will be stored. Should be unique for each database.
 	LocalPath string
 
 	// BucketHandle is the cloud storage bucket to use.
+	// It is prefixed with the unique storage location of the database.
 	BucketHandle *blob.Bucket
-	// DBIdentifier is a unique identifier for the database. Files in the cloud storage bucket are stored in a directory named `DBIdenitifier`
-	DBIdenitifier string
 
 	// BackupFormat is the format to use when backing up the database.
 	BackupFormat BackupFormat
@@ -77,7 +77,7 @@ type DBOptions struct {
 	StableSelect bool
 
 	// LogLevel for the logs. Default: "debug".
-	LogLevel string
+	Logger slog.Logger
 }
 
 type BackupFormat string
@@ -94,10 +94,10 @@ func NewDB(ctx context.Context, opts *DBOptions) (DB, error) {
 	// TODO :: support clean run
 	db := &db{
 		opts:         opts,
-		cloudStorage: blob.PrefixedBucket(opts.BucketHandle, opts.DBIdenitifier),
+		readPath:     filepath.Join(opts.LocalPath, "read"),
+		writePath:    filepath.Join(opts.LocalPath, "write"),
+		cloudStorage: opts.BucketHandle,
 		logger:       zap.NewNop(),
-		readPath:     filepath.Join(opts.LocalPath, opts.DBIdenitifier, "read"),
-		writePath:    filepath.Join(opts.LocalPath, opts.DBIdenitifier, "write"),
 	}
 	err := db.downloadBackup(ctx)
 	if err != nil {
@@ -105,7 +105,7 @@ func NewDB(ctx context.Context, opts *DBOptions) (DB, error) {
 	}
 
 	// create a read handle
-	db.readHandle, err = db.openDBAndAttach(ctx, db.readPath, opts.ReadSettings)
+	db.readHandle, err = db.openDBAndAttach(ctx, db.readPath, opts.ReadSettings, true)
 	if err != nil {
 		return nil, err
 	}
@@ -114,19 +114,18 @@ func NewDB(ctx context.Context, opts *DBOptions) (DB, error) {
 }
 
 type db struct {
-	opts *DBOptions
+	opts      *DBOptions
+	writePath string
+	readPath  string
 
 	readHandle   *sql.DB
 	writeHandle  *sql.DB
 	cloudStorage *blob.Bucket
-	writeDirty   *atomic.Bool
-	readDirty    *atomic.Bool
 
-	writePath string
-	readPath  string
-
-	readMu  sync.RWMutex
-	writeMu sync.Mutex
+	writeDirty *atomic.Bool
+	readDirty  *atomic.Bool
+	readMu     sync.RWMutex
+	writeMu    sync.Mutex
 
 	logger *zap.Logger
 }
@@ -152,13 +151,36 @@ func (d *db) Query(ctx context.Context, query string, args ...any) (*Rows, error
 
 // DropTable implements DB.
 func (d *db) DropTable(ctx context.Context, name string) error {
-	panic("unimplemented")
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	d.logger.Debug("drop table", zap.String("name", name))
+
+	// delete the table directory
+	err := os.RemoveAll(filepath.Join(d.writePath, name))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("drop: table %q not found", name)
+		}
+		return fmt.Errorf("drop: unable to remove table %q: %w", name, err)
+	}
+
+	// drop the table from backup location
+	err = d.deleteFolder(ctx, name)
+	if err != nil {
+		d.writeDirty.Store(true)
+		return fmt.Errorf("drop: unable to delete table %q from backup: %w", name, err)
+	}
+	return d.Sync(ctx)
 }
 
 func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
 	d.logger.Debug("create table", zap.String("name", name), zap.Bool("view", opts.View))
 	var err error
-	d.writeHandle, err = d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings)
+	d.writeHandle, err = d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
 	if err != nil {
 		return err
 	}
@@ -306,45 +328,30 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 }
 
 // Sync implements DB.
-// Table is optional. If table is provided, only that table is synced.
-// Otherwise, the entire database is synced.
 func (d *db) Sync(ctx context.Context) error {
-	readPath, err := os.MkdirTemp(d.opts.LocalPath, "read")
+	err := syncDir(d.readPath, d.writePath)
 	if err != nil {
 		return err
 	}
 
-	err = copyDir(d.writePath, readPath)
+	handle, err := d.openDBAndAttach(ctx, d.readPath, d.opts.ReadSettings, false)
 	if err != nil {
 		return err
 	}
 
-	handle, err := d.openDBAndAttach(ctx, readPath, d.opts.ReadSettings)
-	if err != nil {
-		_ = os.RemoveAll(readPath)
-		return err
-	}
-
-	var (
-		oldReadPath string
-		oldDBHandle *sql.DB
-	)
+	var oldDBHandle *sql.DB
 	d.readMu.Lock()
 	// swap read handle
 	oldDBHandle = d.readHandle
 	d.readHandle = handle
-	// swap read path
-	oldReadPath = d.readPath
-	d.readPath = readPath
 	d.readMu.Unlock()
 
 	// close old read handle
 	err = oldDBHandle.Close()
 	if err != nil {
+		oldDBHandle = nil
 		d.logger.Error("error in closing old read handle", zap.Error(err))
 	}
-	// remove old read path
-	_ = os.RemoveAll(oldReadPath)
 	return nil
 }
 
@@ -401,7 +408,13 @@ func (d *db) downloadBackup(ctx context.Context) error {
 	}
 
 	// Wait for all outstanding downloads to complete
-	return g.Wait()
+	err := g.Wait()
+	if err != nil {
+		return err
+	}
+
+	// copy to read location
+	return syncDir(d.readPath, d.writePath)
 }
 
 func (d *db) replicate(ctx context.Context, table string) error {
@@ -449,7 +462,7 @@ func (d *db) replicate(ctx context.Context, table string) error {
 	})
 }
 
-func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[string]string) (*sql.DB, error) {
+func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[string]string, read bool) (*sql.DB, error) {
 	// open the db
 	url, err := url.Parse(filepath.Join(path, "stage.db"))
 	if err != nil {
@@ -480,7 +493,7 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 		return nil, err
 	}
 
-	err = d.attachDBs(ctx, db, path)
+	err = d.attachDBs(ctx, db, path, read)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -488,7 +501,7 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 	return db, nil
 }
 
-func (d *db) attachDBs(ctx context.Context, db *sql.DB, path string) error {
+func (d *db) attachDBs(ctx context.Context, db *sql.DB, path string, read bool) error {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return err
@@ -535,8 +548,12 @@ func (d *db) attachDBs(ctx context.Context, db *sql.DB, path string) error {
 		}
 		switch BackupFormat(meta.Format) {
 		case BackupFormatDB:
-			dbName := safeSQLName(fmt.Sprintf("%s__db__data", entry.Name()))
-			_, err := db.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s", safeSQLString(filepath.Join(path, "data.db")), dbName))
+			dbName := safeSQLName(dbName(entry.Name()))
+			var readMode string
+			if read {
+				readMode = " (READ_ONLY)"
+			}
+			_, err := db.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s %s", safeSQLString(filepath.Join(path, "data.db")), dbName, readMode))
 			if err != nil {
 				d.logger.Error("error in attaching db", zap.String("table", entry.Name()), zap.Error(err))
 				_ = os.RemoveAll(filepath.Join(path))
