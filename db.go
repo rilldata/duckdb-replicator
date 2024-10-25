@@ -301,6 +301,11 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 }
 
 func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+	if opts == nil {
+		opts = &InsertTableOptions{
+			Strategy: IncrementalStrategyAppend,
+		}
+	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
@@ -701,9 +706,7 @@ func (d *db) execIncrementalInsert(ctx context.Context, h *sql.DB, name, sql str
 
 		// Insert the new data into the target table
 		_, err = conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s SELECT * FROM %s", safeName, byNameClause, safeSQLName(tmp)))
-		if err != nil {
-			return err
-		}
+		return err
 	}
 
 	return fmt.Errorf("incremental insert strategy %q not supported", opts.Strategy)
