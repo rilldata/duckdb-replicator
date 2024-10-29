@@ -12,13 +12,18 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/XSAM/otelsql"
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 	"github.com/marcboeker/go-duckdb"
+	"github.com/mitchellh/mapstructure"
+	"go.opentelemetry.io/otel/attribute"
 	"gocloud.dev/blob"
 )
 
@@ -27,7 +32,14 @@ type DB interface {
 	Close() error
 
 	// Query executes a query that returns rows typically a SELECT.
-	Query(ctx context.Context, query string, args ...any) (*Rows, error)
+	// Release function must be called after results are consumed. It also takes care of closing the rows so no need to call rows.Close separately.
+	Query(ctx context.Context, query string, args ...any) (res *sqlx.Rows, release func() error, err error)
+
+	// AcquireReadConnection returns a connection to the database for reading.
+	// Once done the connection should be released by calling the release function.
+	// This connection must only be used for select queries or for creating and working with temporary tables.
+	// Prefer Query instead of using this method directly for select queries.
+	AcquireReadConnection(ctx context.Context) (conn *sqlx.Conn, release func() error, err error)
 
 	// CreateTableAsSelect creates a new table by name from the results of the given SQL query.
 	CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error
@@ -75,14 +87,108 @@ type DBOptions struct {
 	Logger *slog.Logger
 }
 
-type Rows struct {
-	*sql.Rows
-	cleanUp func()
-}
+// TODO :: revisit this logic
+func (d *DBOptions) ValidateSettings() error {
+	read := &settings{}
+	err := mapstructure.WeakDecode(d.ReadSettings, &read)
+	if err != nil {
+		return fmt.Errorf("read settings: %w", err)
+	}
 
-func (q *Rows) Close() error {
-	q.cleanUp()
-	return q.Rows.Close()
+	write := &settings{}
+	err = mapstructure.WeakDecode(d.WriteSettings, &write)
+	if err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+
+	// no memory limits defined
+	// divide memory equally between read and write
+	if read.MaxMemory == "" && write.MaxMemory == "" {
+		connector, err := duckdb.NewConnector("", nil)
+		if err != nil {
+			return fmt.Errorf("unable to create duckdb connector: %w", err)
+		}
+		defer connector.Close()
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		row := db.QueryRow("SELECT value FROM duckdb_settings() WHERE name = 'max_memory'")
+		var maxMemory string
+		err = row.Scan(&maxMemory)
+		if err != nil {
+			return fmt.Errorf("unable to get max_memory: %w", err)
+		}
+
+		bytes, err := humanReadableSizeToBytes(maxMemory)
+		if err != nil {
+			return fmt.Errorf("unable to parse max_memory: %w", err)
+		}
+
+		read.MaxMemory = fmt.Sprintf("%d bytes", int64(bytes)/2)
+		write.MaxMemory = fmt.Sprintf("%d bytes", int64(bytes)/2)
+	}
+
+	if read.MaxMemory == "" != (write.MaxMemory == "") {
+		// only one is defined
+		var mem string
+		if read.MaxMemory != "" {
+			mem = read.MaxMemory
+		} else {
+			mem = write.MaxMemory
+		}
+
+		bytes, err := humanReadableSizeToBytes(mem)
+		if err != nil {
+			return fmt.Errorf("unable to parse max_memory: %w", err)
+		}
+
+		read.MaxMemory = fmt.Sprintf("%d bytes", int64(bytes)/2)
+		write.MaxMemory = fmt.Sprintf("%d bytes", int64(bytes)/2)
+	}
+
+	if read.Threads == 0 && write.Threads == 0 {
+		connector, err := duckdb.NewConnector("", nil)
+		if err != nil {
+			return fmt.Errorf("unable to create duckdb connector: %w", err)
+		}
+		defer connector.Close()
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		row := db.QueryRow("SELECT value FROM duckdb_settings() WHERE name = 'threads'")
+		var threads int
+		err = row.Scan(&threads)
+		if err != nil {
+			return fmt.Errorf("unable to get threads: %w", err)
+		}
+
+		read.Threads = threads / 2
+		write.Threads = threads / 2
+	}
+
+	if read.Threads == 0 != (write.Threads == 0) {
+		// only one is defined
+		var threads int
+		if read.Threads != 0 {
+			threads = read.Threads
+		} else {
+			threads = write.Threads
+		}
+
+		read.Threads = threads / 2
+		write.Threads = threads / 2
+	}
+
+	err = mapstructure.Decode(read, &d.ReadSettings)
+	if err != nil {
+		return fmt.Errorf("read settings: %w", err)
+	}
+
+	err = mapstructure.Decode(write, &d.WriteSettings)
+	if err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+	return nil
 }
 
 type CreateTableOptions struct {
@@ -110,20 +216,25 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	if dbIdentifier == "" {
 		return nil, fmt.Errorf("db identifier cannot be empty")
 	}
+	err := opts.ValidateSettings()
+	if err != nil {
+		return nil, err
+	}
 	// TODO :: support clean run
 	// For now deleting remote data is equivalent to clean run
 	db := &db{
-		opts:       opts,
-		readPath:   filepath.Join(opts.LocalPath, dbIdentifier, "read"),
-		writePath:  filepath.Join(opts.LocalPath, dbIdentifier, "write"),
-		writeDirty: true,
-		logger:     opts.Logger,
+		dbIdentifier: dbIdentifier,
+		opts:         opts,
+		readPath:     filepath.Join(opts.LocalPath, dbIdentifier, "read"),
+		writePath:    filepath.Join(opts.LocalPath, dbIdentifier, "write"),
+		writeDirty:   true,
+		logger:       opts.Logger,
 	}
 	if opts.BackupProvider != nil {
 		db.backup = blob.PrefixedBucket(opts.BackupProvider.bucket, dbIdentifier)
 	}
 	// create read and write paths
-	err := os.MkdirAll(db.readPath, fs.ModePerm)
+	err = os.MkdirAll(db.readPath, fs.ModePerm)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create read path: %w", err)
 	}
@@ -154,9 +265,10 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 }
 
 type db struct {
-	opts *DBOptions
+	dbIdentifier string
+	opts         *DBOptions
 
-	readHandle *sql.DB
+	readHandle *sqlx.DB
 	readPath   string
 	writePath  string
 	readMu     sync.RWMutex
@@ -181,20 +293,36 @@ func (d *db) Close() error {
 }
 
 // Query implements DB.
-func (d *db) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
+func (d *db) Query(ctx context.Context, query string, args ...any) (*sqlx.Rows, func() error, error) {
 	d.readMu.RLock()
 
-	res, err := d.readHandle.QueryContext(ctx, query, args...)
+	res, err := d.readHandle.QueryxContext(ctx, query, args...)
 	if err != nil {
 		d.readMu.RUnlock()
-		return nil, err
+		return nil, nil, err
 	}
 
-	return &Rows{
-		Rows:    res,
-		cleanUp: d.readMu.RUnlock,
+	return res, func() error {
+		err = res.Close()
+		d.readMu.RUnlock()
+		return err
 	}, nil
+}
 
+func (d *db) AcquireReadConnection(ctx context.Context) (*sqlx.Conn, func() error, error) {
+	d.readMu.RLock()
+
+	conn, err := d.readHandle.Connx(ctx)
+	if err != nil {
+		d.readMu.RUnlock()
+		return nil, nil, err
+	}
+
+	return conn, func() error {
+		err = conn.Close()
+		d.readMu.RUnlock()
+		return err
+	}, nil
 }
 
 func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
@@ -206,7 +334,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 	}
 	d.logger.Info("create table", slog.String("name", name), slog.Bool("view", opts.View))
 
-	writeHandle, err := d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
+	writeHandle, err := d.acquireWriteHandle(ctx)
 	if err != nil {
 		return err
 	}
@@ -301,13 +429,13 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 }
 
 func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	if opts == nil {
 		opts = &InsertTableOptions{
 			Strategy: IncrementalStrategyAppend,
 		}
 	}
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
 
 	d.logger.Info("insert table", slog.String("name", name), slog.Group("option", "by_name", opts.ByName, "strategy", string(opts.Strategy), "unique_key", opts.UniqueKey))
 	// Get current table version
@@ -316,14 +444,14 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 		return fmt.Errorf("table %q does not exist", name)
 	}
 
-	writeHandle, err := d.initWriteHandle(ctx)
+	writeHandle, err := d.acquireWriteHandle(ctx)
 	if err != nil {
 		return err
 	}
 
 	d.writeDirty = true
 	// Execute the insert
-	err = d.execIncrementalInsert(ctx, writeHandle, name, sql, opts)
+	err = execIncrementalInsert(ctx, writeHandle, name, sql, opts)
 	if err != nil {
 		return fmt.Errorf("insert: insert into table %q failed: %w", name, err)
 	}
@@ -461,10 +589,10 @@ func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
 }
 
 func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
-	d.logger.Info("AddTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", typ))
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	d.logger.Info("AddTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", typ))
 	version, exist, err := tableVersion(d.writePath, tableName)
 	if err != nil {
 		return err
@@ -474,7 +602,7 @@ func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ stri
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
 
-	writeHandle, err := d.initWriteHandle(ctx)
+	writeHandle, err := d.acquireWriteHandle(ctx)
 	if err != nil {
 		return err
 	}
@@ -510,11 +638,10 @@ func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ stri
 
 // AlterTableColumn implements drivers.OLAPStore.
 func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
-	d.logger.Info("AlterTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", newType))
-
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
+	d.logger.Info("AlterTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", newType))
 	version, exist, err := tableVersion(d.writePath, tableName)
 	if err != nil {
 		return err
@@ -524,7 +651,7 @@ func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newTyp
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
 
-	writeHandle, err := d.initWriteHandle(ctx)
+	writeHandle, err := d.acquireWriteHandle(ctx)
 	if err != nil {
 		return err
 	}
@@ -623,7 +750,7 @@ func (d *db) Sync(ctx context.Context) error {
 		return err
 	}
 
-	var oldDBHandle *sql.DB
+	var oldDBHandle *sqlx.DB
 	d.readMu.Lock()
 	// swap read handle
 	oldDBHandle = d.readHandle
@@ -640,9 +767,9 @@ func (d *db) Sync(ctx context.Context) error {
 	return nil
 }
 
-// initWriteHandle syncs the write database and initializes the write handle.
+// acquireWriteHandle syncs the write database and initializes the write handle.
 // Should be called only with writeMu locked.
-func (d *db) initWriteHandle(ctx context.Context) (*sql.DB, error) {
+func (d *db) acquireWriteHandle(ctx context.Context) (*sqlx.DB, error) {
 	err := d.syncWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -651,68 +778,7 @@ func (d *db) initWriteHandle(ctx context.Context) (*sql.DB, error) {
 	return d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
 }
 
-func (d *db) execIncrementalInsert(ctx context.Context, h *sql.DB, name, sql string, opts *InsertTableOptions) error {
-	var byNameClause string
-	if opts.ByName {
-		byNameClause = "BY NAME"
-	}
-
-	safeName := fmt.Sprintf("%s.default", safeSQLName(dbName(name)))
-	if opts.Strategy == IncrementalStrategyAppend {
-		_, err := h.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s (%s\n)", safeName, byNameClause, sql))
-		return err
-	}
-
-	conn, err := h.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if opts.Strategy == IncrementalStrategyMerge {
-		// Create a temporary table with the new data
-		tmp := uuid.New().String()
-		_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE TEMPORARY TABLE %s AS (%s\n)", safeSQLName(tmp), sql))
-		if err != nil {
-			return err
-		}
-
-		// check the count of the new data
-		// skip if the count is 0
-		// if there was no data in the empty file then the detected schema can be different from the current schema which leads to errors or performance issues
-		res := conn.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) == 0 FROM %s", safeSQLName(tmp)))
-		var empty bool
-		if err := res.Scan(&empty); err != nil {
-			return err
-		}
-
-		if empty {
-			return nil
-		}
-
-		// Drop the rows from the target table where the unique key is present in the temporary table
-		where := ""
-		for i, key := range opts.UniqueKey {
-			key = safeSQLName(key)
-			if i != 0 {
-				where += " AND "
-			}
-			where += fmt.Sprintf("base.%s IS NOT DISTINCT FROM tmp.%s", key, key)
-		}
-		_, err = conn.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s base WHERE EXISTS (SELECT 1 FROM %s tmp WHERE %s)", safeName, safeSQLName(tmp), where))
-		if err != nil {
-			return err
-		}
-
-		// Insert the new data into the target table
-		_, err = conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s SELECT * FROM %s", safeName, byNameClause, safeSQLName(tmp)))
-		return err
-	}
-
-	return fmt.Errorf("incremental insert strategy %q not supported", opts.Strategy)
-}
-
-func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[string]string, read bool) (*sql.DB, error) {
+func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[string]string, read bool) (*sqlx.DB, error) {
 	// open the db
 	var dsn *url.URL
 	var err error
@@ -731,8 +797,12 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 	}
 	dsn.RawQuery = query.Encode()
 	connector, err := duckdb.NewConnector(dsn.String(), func(execer driver.ExecerContext) error {
-		for _, q := range d.opts.InitQueries {
-			_, err := execer.ExecContext(ctx, q, nil)
+		for _, qry := range d.opts.InitQueries {
+			_, err := execer.ExecContext(context.Background(), qry, nil)
+			if err != nil && strings.Contains(err.Error(), "Failed to download extension") {
+				// Retry using another mirror. Based on: https://github.com/duckdb/duckdb/issues/9378
+				_, err = execer.ExecContext(context.Background(), qry+" FROM 'http://nightly-extensions.duckdb.org'", nil)
+			}
 			if err != nil {
 				return err
 			}
@@ -740,10 +810,30 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 		return nil
 	})
 	if err != nil {
+		// Check for using incompatible database files
+		if strings.Contains(err.Error(), "Trying to read a database file with version number") {
+			return nil, err
+			// TODO :: fix
+			// return nil, fmt.Errorf("database file %q was created with an older, incompatible version of Rill (please remove it and try again)", c.config.DSN)
+		}
+
+		// Check for another process currently accessing the DB
+		if strings.Contains(err.Error(), "Could not set lock on file") {
+			return nil, fmt.Errorf("failed to open database (is Rill already running?): %w", err)
+		}
+
 		return nil, err
 	}
 
-	db := sql.OpenDB(connector)
+	db := sqlx.NewDb(otelsql.OpenDB(connector), "duckdb")
+	// TODO :: Do we need to limit max open connections ?
+	// db.SetMaxOpenConns(c.config.PoolSize)
+
+	err = otelsql.RegisterDBStatsMetrics(db.DB, otelsql.WithAttributes(attribute.String("db.system", "duckdb"), attribute.String("db_identifier", d.dbIdentifier)))
+	if err != nil {
+		return nil, fmt.Errorf("registering db stats metrics: %w", err)
+	}
+
 	err = db.PingContext(ctx)
 	if err != nil {
 		db.Close()
@@ -755,10 +845,32 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 		db.Close()
 		return nil, err
 	}
+
+	// 2023-12-11: Hail mary for solving this issue: https://github.com/duckdblabs/rilldata/issues/6.
+	// Forces DuckDB to create catalog entries for the information schema up front (they are normally created lazily).
+	// Can be removed if the issue persists.
+	_, err = db.ExecContext(context.Background(), `
+		select
+			coalesce(t.table_catalog, current_database()) as "database",
+			t.table_schema as "schema",
+			t.table_name as "name",
+			t.table_type as "type", 
+			array_agg(c.column_name order by c.ordinal_position) as "column_names",
+			array_agg(c.data_type order by c.ordinal_position) as "column_types",
+			array_agg(c.is_nullable = 'YES' order by c.ordinal_position) as "column_nullable"
+		from information_schema.tables t
+		join information_schema.columns c on t.table_schema = c.table_schema and t.table_name = c.table_name
+		group by 1, 2, 3, 4
+		order by 1, 2, 3, 4
+	`)
+	if err != nil {
+		return nil, err
+	}
+
 	return db, nil
 }
 
-func (d *db) attachDBs(ctx context.Context, db *sql.DB, path string, read bool) error {
+func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool) error {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return err
@@ -835,7 +947,7 @@ func (d *db) attachDBs(ctx context.Context, db *sql.DB, path string, read bool) 
 	return nil
 }
 
-func (d *db) generateSelectQuery(ctx context.Context, handle *sql.DB, dbName string) (string, error) {
+func (d *db) generateSelectQuery(ctx context.Context, handle *sqlx.DB, dbName string) (string, error) {
 	if !d.opts.StableSelect {
 		return fmt.Sprintf("SELECT * FROM %s.default", dbName), nil
 	}
@@ -867,6 +979,67 @@ func (d *db) readTableVersion(name string) (string, bool, error) {
 
 func (d *db) writeTableVersion(name string) (string, bool, error) {
 	return tableVersion(d.writePath, name)
+}
+
+func execIncrementalInsert(ctx context.Context, h *sqlx.DB, name, sql string, opts *InsertTableOptions) error {
+	var byNameClause string
+	if opts.ByName {
+		byNameClause = "BY NAME"
+	}
+
+	safeName := fmt.Sprintf("%s.default", safeSQLName(dbName(name)))
+	if opts.Strategy == IncrementalStrategyAppend {
+		_, err := h.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s (%s\n)", safeName, byNameClause, sql))
+		return err
+	}
+
+	conn, err := h.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if opts.Strategy == IncrementalStrategyMerge {
+		// Create a temporary table with the new data
+		tmp := uuid.New().String()
+		_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE TEMPORARY TABLE %s AS (%s\n)", safeSQLName(tmp), sql))
+		if err != nil {
+			return err
+		}
+
+		// check the count of the new data
+		// skip if the count is 0
+		// if there was no data in the empty file then the detected schema can be different from the current schema which leads to errors or performance issues
+		res := conn.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) == 0 FROM %s", safeSQLName(tmp)))
+		var empty bool
+		if err := res.Scan(&empty); err != nil {
+			return err
+		}
+
+		if empty {
+			return nil
+		}
+
+		// Drop the rows from the target table where the unique key is present in the temporary table
+		where := ""
+		for i, key := range opts.UniqueKey {
+			key = safeSQLName(key)
+			if i != 0 {
+				where += " AND "
+			}
+			where += fmt.Sprintf("base.%s IS NOT DISTINCT FROM tmp.%s", key, key)
+		}
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s base WHERE EXISTS (SELECT 1 FROM %s tmp WHERE %s)", safeName, safeSQLName(tmp), where))
+		if err != nil {
+			return err
+		}
+
+		// Insert the new data into the target table
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s SELECT * FROM %s", safeName, byNameClause, safeSQLName(tmp)))
+		return err
+	}
+
+	return fmt.Errorf("incremental insert strategy %q not supported", opts.Strategy)
 }
 
 func tableVersion(path, name string) (string, bool, error) {
@@ -919,4 +1092,62 @@ func retry(maxRetries int, delay time.Duration, fn func() error) error {
 
 func dbName(name string) string {
 	return safeSQLName(fmt.Sprintf("%s__data__db", name))
+}
+
+type settings struct {
+	MaxMemory string `mapstructure:"max_memory"`
+	Threads   int    `mapstructure:"threads"`
+	// Can be more settings
+}
+
+// Regex to parse human-readable size returned by DuckDB
+// nolint
+var humanReadableSizeRegex = regexp.MustCompile(`^([\d.]+)\s*(\S+)$`)
+
+// Reversed logic of StringUtil::BytesToHumanReadableString
+// see https://github.com/cran/duckdb/blob/master/src/duckdb/src/common/string_util.cpp#L157
+// Examples: 1 bytes, 2 bytes, 1KB, 1MB, 1TB, 1PB
+// nolint
+func humanReadableSizeToBytes(sizeStr string) (float64, error) {
+	var multiplier float64
+
+	match := humanReadableSizeRegex.FindStringSubmatch(sizeStr)
+
+	if match == nil {
+		return 0, fmt.Errorf("invalid size format: '%s'", sizeStr)
+	}
+
+	sizeFloat, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, err
+	}
+
+	switch match[2] {
+	case "byte", "bytes":
+		multiplier = 1
+	case "KB":
+		multiplier = 1000
+	case "MB":
+		multiplier = 1000 * 1000
+	case "GB":
+		multiplier = 1000 * 1000 * 1000
+	case "TB":
+		multiplier = 1000 * 1000 * 1000 * 1000
+	case "PB":
+		multiplier = 1000 * 1000 * 1000 * 1000 * 1000
+	case "KiB":
+		multiplier = 1024
+	case "MiB":
+		multiplier = 1024 * 1024
+	case "GiB":
+		multiplier = 1024 * 1024 * 1024
+	case "TiB":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	case "PiB":
+		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("unknown size unit '%s' in '%s'", match[2], sizeStr)
+	}
+
+	return sizeFloat * multiplier, nil
 }

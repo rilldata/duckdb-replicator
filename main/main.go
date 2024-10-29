@@ -39,15 +39,17 @@ import (
 // }
 
 func main() {
-	// bucket, err := blob.OpenBucket(context.Background(), "gs://anshul-rill-test")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// bucket = blob.PrefixedBucket(bucket, "replicator-test/")
+	backup, err := duckdbreplicator.NewGCSBackupProvider(context.Background(), &duckdbreplicator.GCSBackupProviderOptions{
+		UseHostCredentials: true,
+		BucketURL:          "gs://anshul-rill-test/replicator-test/",
+	})
+	if err != nil {
+		panic(err)
+	}
 
 	dbOptions := &duckdbreplicator.DBOptions{
 		LocalPath:      "/home/anshul/workspace/duckdb-replicator-test",
-		BackupProvider: nil,
+		BackupProvider: backup,
 		BackupFormat:   duckdbreplicator.BackupFormatDB,
 		ReadSettings:   map[string]string{"memory_limit": "2GB", "threads": "1"},
 		WriteSettings:  map[string]string{"memory_limit": "8GB", "threads": "4"},
@@ -82,11 +84,11 @@ func main() {
 	}
 
 	t = time.Now()
-	rows, err := db.Query(context.Background(), `SELECT count(*) FROM "test"`)
+	rows, release, err := db.Query(context.Background(), `SELECT count(*) FROM "test"`)
 	if err != nil {
 		fmt.Printf("error %v\n", err)
 	}
-	defer rows.Close()
+	defer release()
 	fmt.Printf("time taken %v\n", time.Since(t))
 
 	var count int

@@ -29,7 +29,7 @@ func TestDB(t *testing.T) {
 	require.NoError(t, err)
 
 	// query table
-	rows, err := db.Query(ctx, "SELECT id, country FROM test")
+	rows, release, err := db.Query(ctx, "SELECT id, country FROM test")
 	require.NoError(t, err)
 
 	var (
@@ -42,7 +42,7 @@ func TestDB(t *testing.T) {
 	require.Equal(t, "India", country)
 	require.False(t, rows.Next())
 	require.NoError(t, rows.Err())
-	require.NoError(t, rows.Close())
+	require.NoError(t, release())
 
 	// rename table
 	err = db.RenameTable(ctx, "test", "test2")
@@ -64,7 +64,7 @@ func TestDB(t *testing.T) {
 	require.NoError(t, err)
 
 	// query table
-	rows, err = db.Query(ctx, "SELECT id, country FROM test2 where id = 2")
+	rows, release, err = db.Query(ctx, "SELECT id, country FROM test2 where id = 2")
 	require.NoError(t, err)
 	require.True(t, rows.Next())
 	require.NoError(t, rows.Scan(&id, &country))
@@ -72,7 +72,7 @@ func TestDB(t *testing.T) {
 	require.Equal(t, "USA", country)
 	require.False(t, rows.Next())
 	require.NoError(t, rows.Err())
-	require.NoError(t, rows.Close())
+	require.NoError(t, release())
 
 	// Add column
 	err = db.AddTableColumn(ctx, "test2", "city", "TEXT")
