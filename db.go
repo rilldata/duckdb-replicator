@@ -90,13 +90,13 @@ type DBOptions struct {
 // TODO :: revisit this logic
 func (d *DBOptions) ValidateSettings() error {
 	read := &settings{}
-	err := mapstructure.WeakDecode(d.ReadSettings, &read)
+	err := mapstructure.Decode(d.ReadSettings, read)
 	if err != nil {
 		return fmt.Errorf("read settings: %w", err)
 	}
 
 	write := &settings{}
-	err = mapstructure.WeakDecode(d.WriteSettings, &write)
+	err = mapstructure.Decode(d.WriteSettings, write)
 	if err != nil {
 		return fmt.Errorf("write settings: %w", err)
 	}
@@ -146,7 +146,21 @@ func (d *DBOptions) ValidateSettings() error {
 		write.MaxMemory = fmt.Sprintf("%d bytes", int64(bytes)/2)
 	}
 
-	if read.Threads == 0 && write.Threads == 0 {
+	var readThread, writeThread int
+	if read.Threads != "" {
+		readThread, err = strconv.Atoi(read.Threads)
+		if err != nil {
+			return fmt.Errorf("unable to parse read threads: %w", err)
+		}
+	}
+	if write.Threads != "" {
+		writeThread, err = strconv.Atoi(write.Threads)
+		if err != nil {
+			return fmt.Errorf("unable to parse write threads: %w", err)
+		}
+	}
+
+	if readThread == 0 && writeThread == 0 {
 		connector, err := duckdb.NewConnector("", nil)
 		if err != nil {
 			return fmt.Errorf("unable to create duckdb connector: %w", err)
@@ -162,31 +176,31 @@ func (d *DBOptions) ValidateSettings() error {
 			return fmt.Errorf("unable to get threads: %w", err)
 		}
 
-		read.Threads = threads / 2
-		write.Threads = threads / 2
+		read.Threads = strconv.Itoa(threads / 2)
+		write.Threads = strconv.Itoa(threads / 2)
 	}
 
-	if read.Threads == 0 != (write.Threads == 0) {
+	if readThread == 0 != (writeThread == 0) {
 		// only one is defined
 		var threads int
-		if read.Threads != 0 {
-			threads = read.Threads
+		if readThread != 0 {
+			threads = readThread
 		} else {
-			threads = write.Threads
+			threads = writeThread
 		}
 
-		read.Threads = threads / 2
-		write.Threads = threads / 2
+		read.Threads = strconv.Itoa(threads / 2)
+		write.Threads = strconv.Itoa(threads / 2)
 	}
 
-	err = mapstructure.Decode(read, &d.ReadSettings)
+	err = mapstructure.WeakDecode(read, &d.ReadSettings)
 	if err != nil {
-		return fmt.Errorf("read settings: %w", err)
+		return fmt.Errorf("failed to update read settings: %w", err)
 	}
 
-	err = mapstructure.Decode(write, &d.WriteSettings)
+	err = mapstructure.WeakDecode(write, &d.WriteSettings)
 	if err != nil {
-		return fmt.Errorf("write settings: %w", err)
+		return fmt.Errorf("failed to update write settings: %w", err)
 	}
 	return nil
 }
@@ -212,6 +226,7 @@ type InsertTableOptions struct {
 
 // NewDB creates a new DB instance.
 // This can be a slow operation if the backup is large.
+// dbIdentifier is a unique identifier for the database reported in metrics.
 func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error) {
 	if dbIdentifier == "" {
 		return nil, fmt.Errorf("db identifier cannot be empty")
@@ -225,13 +240,13 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	db := &db{
 		dbIdentifier: dbIdentifier,
 		opts:         opts,
-		readPath:     filepath.Join(opts.LocalPath, dbIdentifier, "read"),
-		writePath:    filepath.Join(opts.LocalPath, dbIdentifier, "write"),
+		readPath:     filepath.Join(opts.LocalPath, "read"),
+		writePath:    filepath.Join(opts.LocalPath, "write"),
 		writeDirty:   true,
 		logger:       opts.Logger,
 	}
 	if opts.BackupProvider != nil {
-		db.backup = blob.PrefixedBucket(opts.BackupProvider.bucket, dbIdentifier)
+		db.backup = opts.BackupProvider.bucket
 	}
 	// create read and write paths
 	err = os.MkdirAll(db.readPath, fs.ModePerm)
@@ -875,6 +890,8 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 	if err != nil {
 		return err
 	}
+
+	var views []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -882,19 +899,19 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 		version, exist, err := tableVersion(path, entry.Name())
 		if err != nil {
 			d.logger.Error("error in fetching db version", slog.String("table", entry.Name()), slog.Any("error", err))
-			_ = os.RemoveAll(path)
+			_ = os.RemoveAll(filepath.Join(path, entry.Name()))
 			continue
 		}
 		if !exist {
-			_ = os.RemoveAll(path)
+			_ = os.RemoveAll(filepath.Join(path, entry.Name()))
 			continue
 		}
-		path := filepath.Join(path, entry.Name(), version)
+		versionPath := filepath.Join(path, entry.Name(), version)
 
 		// read meta file
-		f, err := os.ReadFile(filepath.Join(path, "meta.json"))
+		f, err := os.ReadFile(filepath.Join(versionPath, "meta.json"))
 		if err != nil {
-			_ = os.RemoveAll(path)
+			_ = os.RemoveAll(versionPath)
 			d.logger.Error("error in reading meta file", slog.String("table", entry.Name()), slog.Any("error", err))
 			// May be keep it as a config to return error or continue ?
 			continue
@@ -902,17 +919,14 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 		var meta meta
 		err = json.Unmarshal(f, &meta)
 		if err != nil {
-			_ = os.RemoveAll(path)
+			_ = os.RemoveAll(versionPath)
 			d.logger.Error("error in unmarshalling meta file", slog.String("table", entry.Name()), slog.Any("error", err))
 			continue
 		}
 
 		if meta.ViewSQL != "" {
 			// table is a view
-			_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS %s", safeSQLName(entry.Name()), meta.ViewSQL))
-			if err != nil {
-				return err
-			}
+			views = append(views, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS (%s\n)", safeSQLName(entry.Name()), meta.ViewSQL))
 			continue
 		}
 		switch BackupFormat(meta.Format) {
@@ -922,10 +936,10 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 			if read {
 				readMode = " (READ_ONLY)"
 			}
-			_, err := db.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s %s", safeSQLString(filepath.Join(path, "data.db")), safeSQLName(dbName), readMode))
+			_, err := db.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s %s", safeSQLString(filepath.Join(versionPath, "data.db")), safeSQLName(dbName), readMode))
 			if err != nil {
 				d.logger.Error("error in attaching db", slog.String("table", entry.Name()), slog.Any("error", err))
-				_ = os.RemoveAll(filepath.Join(path))
+				_ = os.RemoveAll(versionPath)
 				continue
 			}
 
@@ -942,6 +956,13 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 			panic("unimplemented")
 		default:
 			return fmt.Errorf("unknown backup format %q", meta.Format)
+		}
+	}
+	// create views after attaching all the DBs since views can depend on other tables
+	for _, view := range views {
+		_, err := db.ExecContext(ctx, view)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1091,12 +1112,12 @@ func retry(maxRetries int, delay time.Duration, fn func() error) error {
 }
 
 func dbName(name string) string {
-	return safeSQLName(fmt.Sprintf("%s__data__db", name))
+	return fmt.Sprintf("%s__data__db", name)
 }
 
 type settings struct {
 	MaxMemory string `mapstructure:"max_memory"`
-	Threads   int    `mapstructure:"threads"`
+	Threads   string `mapstructure:"threads"`
 	// Can be more settings
 }
 

@@ -5,6 +5,8 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
 	"strings"
 
 	"github.com/XSAM/otelsql"
@@ -20,6 +22,7 @@ type singledb struct {
 
 type SingleDBOptions struct {
 	DSN         string
+	Clean       bool
 	InitQueries []string
 	Logger      *slog.Logger
 }
@@ -27,6 +30,18 @@ type SingleDBOptions struct {
 // NewSingleDB creates a new DB that writes to and reads from a single DuckDB database.
 // This is useful for testing and small datasets.
 func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
+	if opts.Clean {
+		u, err := url.Parse(opts.DSN)
+		if err != nil {
+			return nil, err
+		}
+		if u.Path != "" {
+			err = os.Remove(u.Path)
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+		}
+	}
 	connector, err := duckdb.NewConnector(opts.DSN, func(execer driver.ExecerContext) error {
 		for _, qry := range opts.InitQueries {
 			_, err := execer.ExecContext(context.Background(), qry, nil)
@@ -118,7 +133,18 @@ func (s *singledb) CreateTableAsSelect(ctx context.Context, name string, sql str
 
 // DropTable implements DB.
 func (s *singledb) DropTable(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("DROP TABLE %s", safeSQLName(name)))
+	view, err := s.isView(ctx, name)
+	if err != nil {
+		return err
+	}
+	var typ string
+	if view {
+		typ = "VIEW"
+	} else {
+		typ = "TABLE"
+	}
+
+	_, err = s.db.ExecContext(ctx, fmt.Sprintf("DROP %s %s", typ, safeSQLName(name)))
 	return err
 }
 
@@ -145,13 +171,42 @@ func (s *singledb) Query(ctx context.Context, query string, args ...any) (res *s
 
 // RenameTable implements DB.
 func (s *singledb) RenameTable(ctx context.Context, oldName string, newName string) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", safeSQLName(oldName), safeSQLName(newName)))
+	view, err := s.isView(ctx, oldName)
+	if err != nil {
+		return err
+	}
+	var typ string
+	if view {
+		typ = "VIEW"
+	} else {
+		typ = "TABLE"
+	}
+
+	_, err = s.db.ExecContext(ctx, fmt.Sprintf("ALTER %s %s RENAME TO %s", typ, safeSQLName(oldName), safeSQLName(newName)))
 	return err
 }
 
 // Sync implements DB.
 func (s *singledb) Sync(ctx context.Context) error {
 	return nil
+}
+
+func (s *singledb) isView(ctx context.Context, name string) (bool, error) {
+	var view bool
+	err := s.db.QueryRowxContext(ctx, `
+		SELECT 
+			UPPER(table_type) = 'VIEW' 
+		FROM 
+			information_schema.tables 
+		WHERE 
+			table_catalog = current_database() 
+			AND table_schema = 'main' 
+			AND LOWER(table_name) = LOWER(?)
+	`, name).Scan(&view)
+	if err != nil {
+		return false, err
+	}
+	return view, nil
 }
 
 var _ DB = &singledb{}

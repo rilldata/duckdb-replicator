@@ -38,7 +38,14 @@ type GCSBackupProviderOptions struct {
 	// UseHostCredentials specifies whether to use the host's default credentials.
 	UseHostCredentials         bool
 	ApplicationCredentialsJSON string
-	BucketURL                  string
+	// Bucket is the GCS bucket to use for backups. Should be of the form `gs://bucket-name`.
+	Bucket           string
+	// BackupFormat specifies the format of the backup.
+	// TODO :: implement backup format. Fixed to DuckDB for now.
+	BackupFormat    BackupFormat
+	// UnqiueIdentifier is used to store backups in a unique location. 
+	// This must be set when multiple databases are writing to the same bucket.
+	UniqueIdentifier string
 }
 
 // NewGCSBackupProvider creates a new BackupProvider based on GCS.
@@ -48,17 +55,19 @@ func NewGCSBackupProvider(ctx context.Context, opts *GCSBackupProviderOptions) (
 		return nil, err
 	}
 
-	u, err := url.Parse(opts.BucketURL)
+	u, err := url.Parse(opts.Bucket)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse bucket url %q, %w", opts.BucketURL, err)
+		return nil, fmt.Errorf("failed to parse bucket url %q, %w", opts.Bucket, err)
 	}
 
 	bucket, err := gcsblob.OpenBucket(ctx, client, u.Host, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open bucket %q, %w", opts.BucketURL, err)
+		return nil, fmt.Errorf("failed to open bucket %q, %w", opts.Bucket, err)
 	}
 
-	bucket = blob.PrefixedBucket(bucket, u.Path)
+	if opts.UniqueIdentifier != "" {
+		bucket = blob.PrefixedBucket(bucket, opts.UniqueIdentifier)
+	}
 	return &BackupProvider{
 		bucket: bucket,
 	}, nil

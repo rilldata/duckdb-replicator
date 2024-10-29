@@ -41,7 +41,7 @@ import (
 func main() {
 	backup, err := duckdbreplicator.NewGCSBackupProvider(context.Background(), &duckdbreplicator.GCSBackupProviderOptions{
 		UseHostCredentials: true,
-		BucketURL:          "gs://anshul-rill-test/replicator-test/",
+		Bucket:             "gs://anshul-rill-test/replicator-test/",
 	})
 	if err != nil {
 		panic(err)
