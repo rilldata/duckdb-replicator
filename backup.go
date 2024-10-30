@@ -39,11 +39,11 @@ type GCSBackupProviderOptions struct {
 	UseHostCredentials         bool
 	ApplicationCredentialsJSON string
 	// Bucket is the GCS bucket to use for backups. Should be of the form `gs://bucket-name`.
-	Bucket           string
+	Bucket string
 	// BackupFormat specifies the format of the backup.
 	// TODO :: implement backup format. Fixed to DuckDB for now.
-	BackupFormat    BackupFormat
-	// UnqiueIdentifier is used to store backups in a unique location. 
+	BackupFormat BackupFormat
+	// UnqiueIdentifier is used to store backups in a unique location.
 	// This must be set when multiple databases are writing to the same bucket.
 	UniqueIdentifier string
 }
@@ -66,6 +66,9 @@ func NewGCSBackupProvider(ctx context.Context, opts *GCSBackupProviderOptions) (
 	}
 
 	if opts.UniqueIdentifier != "" {
+		if !strings.HasSuffix(opts.UniqueIdentifier, "/") {
+			opts.UniqueIdentifier += "/"
+		}
 		bucket = blob.PrefixedBucket(bucket, opts.UniqueIdentifier)
 	}
 	return &BackupProvider{
@@ -122,7 +125,7 @@ func (d *db) syncWrite(ctx context.Context) error {
 			// invalid table directory
 			// TODO :: differ between not found and other errors
 			d.logger.Warn("SyncWithObjectStorage: invalid table directory", slog.String("table", table))
-			d.deleteBackupTable(ctx, table, "")
+			d.deleteBackup(ctx, table, "")
 			continue
 		}
 		backedUpVersion := string(res)
@@ -223,55 +226,60 @@ func (d *db) syncBackup(ctx context.Context, table string) error {
 		return fmt.Errorf("table %q not found", table)
 	}
 
-	// upload version directory and copy to read location
-	return retry(5, 10*time.Second, func() error {
-		// Nested directories ??
-		path := filepath.Join(d.writePath, table, version)
-		entries, err := os.ReadDir(path)
+	path := filepath.Join(d.writePath, table, version)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		d.logger.Info("replicating file", slog.String("file", entry.Name()), slog.String("path", path))
+		// no directory should exist as of now
+		if entry.IsDir() {
+			d.logger.Info("found directory in path which should not exist", slog.String("file", entry.Name()), slog.String("path", path))
+			continue
+		}
+
+		wr, err := os.Open(filepath.Join(path, entry.Name()))
 		if err != nil {
 			return err
 		}
 
-		for _, entry := range entries {
-			d.logger.Info("replicating file", slog.String("file", entry.Name()), slog.String("path", path))
-			// nested directories
-			if entry.IsDir() {
-				continue
-			}
-
-			wr, err := os.Open(filepath.Join(path, entry.Name()))
-			if err != nil {
-				return err
-			}
-
-			// upload to cloud storage
-			err = d.backup.Upload(ctx, filepath.Join(table, version, entry.Name()), wr, &blob.WriterOptions{
+		// upload to cloud storage
+		err = retry(5, 10*time.Second, func() error {
+			return d.backup.Upload(ctx, filepath.Join(table, version, entry.Name()), wr, &blob.WriterOptions{
 				ContentType: "application/octet-stream",
 			})
-			if err != nil {
-				wr.Close()
-				return err
-			}
-			wr.Close()
+		})
+		wr.Close()
+		if err != nil {
+			return err
 		}
+	}
 
-		// update version.txt
-		return d.backup.WriteAll(ctx, filepath.Join(table, "version.txt"), []byte(version), nil)
-	})
+	// update version.txt
+	return d.backup.WriteAll(ctx, filepath.Join(table, "version.txt"), []byte(version), nil)
 }
 
-// deleteBackupTable deletes table from backup location.
-// If version is specified, only that version is deleted.
-func (d *db) deleteBackupTable(ctx context.Context, name, version string) error {
+// deleteBackup deletes backup.
+// If table is specified, only that table is deleted.
+// If table and version is specified, only that version of the table is deleted.
+func (d *db) deleteBackup(ctx context.Context, table, version string) error {
 	if d.backup == nil {
 		return nil
 	}
-	var prefix string
-	if version != "" {
-		prefix = filepath.Join(name, version) + "/"
-	} else {
-		prefix = name + "/"
+	if table == "" && version != "" {
+		return fmt.Errorf("table must be specified if version is specified")
 	}
+	var prefix string
+	if table != "" {
+		if version != "" {
+			prefix = filepath.Join(table, version) + "/"
+		} else {
+			prefix = table + "/"
+		}
+	}
+
 	iter := d.backup.List(&blob.ListOptions{Prefix: prefix})
 	for {
 		obj, err := iter.Next(ctx)
@@ -281,10 +289,25 @@ func (d *db) deleteBackupTable(ctx context.Context, name, version string) error 
 			}
 			return err
 		}
-		err = d.backup.Delete(ctx, obj.Key)
+		err = retry(5, 10*time.Second, func() error { return d.backup.Delete(ctx, obj.Key) })
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func retry(maxRetries int, delay time.Duration, fn func() error) error {
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		err = fn()
+		if err == nil {
+			return nil // success
+		} else if strings.Contains(err.Error(), "stream error: stream ID") {
+			time.Sleep(delay) // retry
+		} else {
+			break // return error
+		}
+	}
+	return err
 }

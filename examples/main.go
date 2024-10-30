@@ -10,49 +10,22 @@ import (
 	_ "gocloud.dev/blob/gcsblob"
 )
 
-// func main() {
-// 	bucket, err := blob.OpenBucket(context.Background(), "gs://anshul-rill-test")
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	defer bucket.Close()
-
-// 	bucket = blob.PrefixedBucket(bucket, "replicator-test/")
-
-// 	ctx := context.Background()
-// 	iter := bucket.List(&blob.ListOptions{Prefix: "test-2"})
-// 	for {
-// 		obj, err := iter.Next(ctx)
-// 		if err != nil {
-// 			if err == io.EOF {
-// 				fmt.Println("EOF")
-// 				break
-// 			}
-// 			panic(err)
-// 		}
-// 		fmt.Println(obj.Key + " " + strconv.FormatBool(obj.IsDir))
-// 		// err = bucket.Delete(ctx, obj.Key)
-// 		// if err != nil {
-// 		// 	panic(err)
-// 		// }
-// 	}
-// }
-
 func main() {
 	backup, err := duckdbreplicator.NewGCSBackupProvider(context.Background(), &duckdbreplicator.GCSBackupProviderOptions{
 		UseHostCredentials: true,
-		Bucket:             "gs://anshul-rill-test/replicator-test/",
+		Bucket:             "gs://<bucket>/",
+		UniqueIdentifier:   "756c6367-e807-43ff-8b07-df1bae29c57e/",
 	})
 	if err != nil {
 		panic(err)
 	}
 
 	dbOptions := &duckdbreplicator.DBOptions{
-		LocalPath:      "/home/anshul/workspace/duckdb-replicator-test",
+		LocalPath:      "<local-path>",
 		BackupProvider: backup,
 		BackupFormat:   duckdbreplicator.BackupFormatDB,
 		ReadSettings:   map[string]string{"memory_limit": "2GB", "threads": "1"},
-		WriteSettings:  map[string]string{"memory_limit": "8GB", "threads": "4"},
+		WriteSettings:  map[string]string{"memory_limit": "8GB", "threads": "2"},
 		InitQueries:    []string{"SET autoinstall_known_extensions=true", "SET autoload_known_extensions=true"},
 		StableSelect:   true,
 		Logger:         slog.Default(),
@@ -65,18 +38,21 @@ func main() {
 	defer db.Close()
 
 	t := time.Now()
-	err = db.CreateTableAsSelect(context.Background(), "test-2", `SELECT * FROM read_parquet('/home/anshul/Downloads/trip_data/yellow*.parquet') LIMIT 1000`, nil)
+	// create table
+	err = db.CreateTableAsSelect(context.Background(), "test-2", `SELECT * FROM read_parquet('data*.parquet')`, nil)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("time taken %v\n", time.Since(t))
 
+	// rename table
 	err = db.RenameTable(context.Background(), "test-2", "test")
 	if err != nil {
 		panic(err)
 	}
 
-	err = db.InsertTableAsSelect(context.Background(), "test", `SELECT * FROM read_parquet('/home/anshul/Downloads/trip_data/yellow*.parquet') LIMIT 1000`, &duckdbreplicator.InsertTableOptions{
+	// insert into renamed table
+	err = db.InsertTableAsSelect(context.Background(), "test", `SELECT * FROM read_parquet('data*.parquet')`, &duckdbreplicator.InsertTableOptions{
 		Strategy: duckdbreplicator.IncrementalStrategyAppend,
 	})
 	if err != nil {
@@ -84,6 +60,7 @@ func main() {
 	}
 
 	t = time.Now()
+	// select count
 	rows, release, err := db.Query(context.Background(), `SELECT count(*) FROM "test"`)
 	if err != nil {
 		fmt.Printf("error %v\n", err)

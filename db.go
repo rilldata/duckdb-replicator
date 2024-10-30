@@ -235,8 +235,6 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	if err != nil {
 		return nil, err
 	}
-	// TODO :: support clean run
-	// For now deleting remote data is equivalent to clean run
 	db := &db{
 		dbIdentifier: dbIdentifier,
 		opts:         opts,
@@ -248,6 +246,14 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	if opts.BackupProvider != nil {
 		db.backup = opts.BackupProvider.bucket
 	}
+	// if clean is true, remove the backup
+	if opts.Clean {
+		err = db.deleteBackup(ctx, "", "")
+		if err != nil {
+			return nil, fmt.Errorf("unable to clean backup: %w", err)
+		}
+	}
+
 	// create read and write paths
 	err = os.MkdirAll(db.readPath, fs.ModePerm)
 	if err != nil {
@@ -436,7 +442,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 
 	if oldVersionExists {
 		_ = os.RemoveAll(filepath.Join(d.writePath, name, oldVersion))
-		_ = d.deleteBackupTable(ctx, name, oldVersion)
+		_ = d.deleteBackup(ctx, name, oldVersion)
 	}
 	// both backups and write are now in sync
 	d.writeDirty = false
@@ -499,7 +505,7 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 
 	// Delete the old version (ignoring errors since source the new data has already been correctly inserted)
 	_ = os.RemoveAll(oldVersionDir)
-	_ = d.deleteBackupTable(ctx, name, oldVersion)
+	_ = d.deleteBackup(ctx, name, oldVersion)
 	return d.Sync(ctx)
 }
 
@@ -528,7 +534,7 @@ func (d *db) DropTable(ctx context.Context, name string) error {
 	}
 
 	// drop the table from backup location
-	err = d.deleteBackupTable(ctx, name, "")
+	err = d.deleteBackup(ctx, name, "")
 	if err != nil {
 		return fmt.Errorf("drop: unable to drop table %q from backup: %w", name, err)
 	}
@@ -594,8 +600,15 @@ func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
 		if err != nil {
 			d.logger.Error("rename: unable to delete old version of new table", slog.Any("error", err))
 		}
+		err = d.deleteBackup(ctx, newName, oldVersionInNewDir)
+		if err != nil {
+			d.logger.Error("rename: unable to delete old version of new table from backup", slog.Any("error", err))
+		}
 	}
-
+	err = d.deleteBackup(ctx, oldName, "")
+	if err != nil {
+		d.logger.Error("rename: unable to delete old table from backup", slog.Any("error", err))
+	}
 	if d.syncBackup(ctx, newName) != nil {
 		return fmt.Errorf("rename: unable to replicate new table")
 	}
@@ -1094,21 +1107,6 @@ func writeMeta(path string, meta meta) error {
 		return fmt.Errorf("create: write meta failed: %w", err)
 	}
 	return nil
-}
-
-func retry(maxRetries int, delay time.Duration, fn func() error) error {
-	var err error
-	for i := 0; i < maxRetries; i++ {
-		err = fn()
-		if err == nil {
-			return nil // success
-		} else if strings.Contains(err.Error(), "stream error: stream ID") {
-			time.Sleep(delay) // retry
-		} else {
-			break // return error
-		}
-	}
-	return err
 }
 
 func dbName(name string) string {
