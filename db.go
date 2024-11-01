@@ -31,15 +31,21 @@ type DB interface {
 	// Close closes the database.
 	Close() error
 
-	// Query executes a query that returns rows typically a SELECT.
-	// Release function must be called after results are consumed. It also takes care of closing the rows so no need to call rows.Close separately.
-	Query(ctx context.Context, query string, args ...any) (res *sqlx.Rows, release func() error, err error)
-
 	// AcquireReadConnection returns a connection to the database for reading.
 	// Once done the connection should be released by calling the release function.
 	// This connection must only be used for select queries or for creating and working with temporary tables.
 	// Prefer Query instead of using this method directly for select queries.
-	AcquireReadConnection(ctx context.Context) (conn *sqlx.Conn, release func() error, err error)
+	AcquireReadConnection(ctx context.Context) (conn Conn, release func() error, err error)
+
+	// AcquireWriteConnection returns a connection to the database for writing.
+	// Once done the connection should be released by calling the release function.
+	// Any persistent changes to the database should be done by calling CRUD APIs only.
+	AcquireWriteConnection(ctx context.Context) (conn Conn, release func() error, err error)
+
+	// Sync synchronizes the database with the cloud storage.
+	Sync(ctx context.Context) error
+
+	// CRUD APIs
 
 	// CreateTableAsSelect creates a new table by name from the results of the given SQL query.
 	CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error
@@ -58,9 +64,6 @@ type DB interface {
 
 	// AlterTableColumn alters the type of a column in the table.
 	AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error
-
-	// Sync synchronizes the database with the cloud storage.
-	Sync(ctx context.Context) error
 }
 
 type DBOptions struct {
@@ -313,54 +316,52 @@ func (d *db) Close() error {
 	return d.readHandle.Close()
 }
 
-// Query implements DB.
-func (d *db) Query(ctx context.Context, query string, args ...any) (*sqlx.Rows, func() error, error) {
+func (d *db) AcquireReadConnection(ctx context.Context) (Conn, func() error, error) {
 	d.readMu.RLock()
 
-	res, err := d.readHandle.QueryxContext(ctx, query, args...)
+	c, err := d.readHandle.Connx(ctx)
 	if err != nil {
 		d.readMu.RUnlock()
 		return nil, nil, err
 	}
 
-	return res, func() error {
-		err = res.Close()
-		d.readMu.RUnlock()
-		return err
-	}, nil
+	return &conn{
+			Conn: c,
+			db:   d,
+		}, func() error {
+			err = c.Close()
+			d.readMu.RUnlock()
+			return err
+		}, nil
 }
 
-func (d *db) AcquireReadConnection(ctx context.Context) (*sqlx.Conn, func() error, error) {
-	d.readMu.RLock()
-
-	conn, err := d.readHandle.Connx(ctx)
+func (d *db) AcquireWriteConnection(ctx context.Context) (Conn, func() error, error) {
+	c, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
-		d.readMu.RUnlock()
 		return nil, nil, err
 	}
 
-	return conn, func() error {
-		err = conn.Close()
-		d.readMu.RUnlock()
-		return err
-	}, nil
+	return &conn{
+		Conn: c,
+		db:   d,
+	}, release, nil
+
 }
 
 func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
 	if opts == nil {
 		opts = &CreateTableOptions{}
 	}
 	d.logger.Info("create table", slog.String("name", name), slog.Bool("view", opts.View))
-
-	writeHandle, err := d.acquireWriteHandle(ctx)
+	conn, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
 		return err
 	}
-	// Does not detaching attached DBs and directly closing the handle leak memory ?
-	defer writeHandle.Close()
+	defer release()
+	return d.createTableAsSelect(ctx, conn, release, name, sql, opts)
+}
+
+func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, sql string, opts *CreateTableOptions) error {
 
 	// check if some older version exists
 	oldVersion, oldVersionExists, _ := tableVersion(d.writePath, name)
@@ -369,7 +370,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 	// create new version directory
 	newVersion := newVersion()
 	newVersionDir := filepath.Join(d.writePath, name, newVersion)
-	err = os.MkdirAll(newVersionDir, fs.ModePerm)
+	err := os.MkdirAll(newVersionDir, fs.ModePerm)
 	if err != nil {
 		return fmt.Errorf("create: unable to create dir %q: %w", name, err)
 	}
@@ -377,7 +378,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 	var m meta
 	if opts.View {
 		// create view - validates that SQL is correct
-		_, err = writeHandle.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS (%s\n)", safeSQLName(name), sql))
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS (%s\n)", safeSQLName(name), sql))
 		if err != nil {
 			return err
 		}
@@ -389,24 +390,24 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 		safeDBName := safeSQLName(dbName(name))
 
 		// detach existing db
-		_, err = writeHandle.ExecContext(ctx, fmt.Sprintf("DETACH DATABASE IF EXISTS %s", safeDBName), nil)
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("DETACH DATABASE IF EXISTS %s", safeDBName), nil)
 		if err != nil {
 			_ = os.RemoveAll(newVersionDir)
 			return fmt.Errorf("create: detach %q db failed: %w", safeDBName, err)
 		}
 
 		// attach new db
-		_, err = writeHandle.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s", safeSQLString(dbFile), safeDBName), nil)
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s", safeSQLString(dbFile), safeDBName), nil)
 		if err != nil {
 			_ = os.RemoveAll(newVersionDir)
 			return fmt.Errorf("create: attach %q db failed: %w", dbFile, err)
 		}
 
 		// ingest data
-		_, err = writeHandle.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE TABLE %s.default AS (%s\n)", safeDBName, sql), nil)
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE TABLE %s.default AS (%s\n)", safeDBName, sql), nil)
 		if err != nil {
 			_ = os.RemoveAll(newVersionDir)
-			_, _ = writeHandle.ExecContext(ctx, fmt.Sprintf("DETACH DATABASE %s", safeDBName))
+			_, _ = conn.ExecContext(ctx, fmt.Sprintf("DETACH DATABASE %s", safeDBName))
 			return fmt.Errorf("create: create %q.default table failed: %w", safeDBName, err)
 		}
 
@@ -428,7 +429,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 	}
 
 	// close write handle before syncing read so that temp files or wal files if any are removed
-	err = writeHandle.Close()
+	err = releaseConn()
 	if err != nil {
 		return err
 	}
@@ -450,8 +451,6 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 }
 
 func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
 	if opts == nil {
 		opts = &InsertTableOptions{
 			Strategy: IncrementalStrategyAppend,
@@ -459,20 +458,24 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 	}
 
 	d.logger.Info("insert table", slog.String("name", name), slog.Group("option", "by_name", opts.ByName, "strategy", string(opts.Strategy), "unique_key", opts.UniqueKey))
+	conn, release, err := d.acquireWriteConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return d.insertTableAsSelect(ctx, conn, release, name, sql, opts)
+}
+
+func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, sql string, opts *InsertTableOptions) error {
 	// Get current table version
 	oldVersion, oldVersionExists, err := tableVersion(d.writePath, name)
 	if err != nil || !oldVersionExists {
 		return fmt.Errorf("table %q does not exist", name)
 	}
 
-	writeHandle, err := d.acquireWriteHandle(ctx)
-	if err != nil {
-		return err
-	}
-
 	d.writeDirty = true
 	// Execute the insert
-	err = execIncrementalInsert(ctx, writeHandle, name, sql, opts)
+	err = execIncrementalInsert(ctx, conn, fmt.Sprintf("%s.default", safeSQLName(dbName(name))), sql, opts)
 	if err != nil {
 		return fmt.Errorf("insert: insert into table %q failed: %w", name, err)
 	}
@@ -491,7 +494,7 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 		return fmt.Errorf("insert: write version file failed: %w", err)
 	}
 
-	err = writeHandle.Close()
+	err = releaseConn()
 	if err != nil {
 		return err
 	}
@@ -511,24 +514,25 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 
 // DropTable implements DB.
 func (d *db) DropTable(ctx context.Context, name string) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
 	d.logger.Info("drop table", slog.String("name", name))
+	_, release, err := d.acquireWriteConn(ctx) // we don't need the handle but need to sync the write pah
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return d.dropTable(ctx, name)
+}
+
+func (d *db) dropTable(ctx context.Context, name string) error {
 	_, exist, _ := tableVersion(d.writePath, name)
 	if !exist {
 		return fmt.Errorf("drop: table %q not found", name)
 	}
 
-	// sync from backup
-	err := d.syncWrite(ctx)
-	if err != nil {
-		return err
-	}
-
 	d.writeDirty = true
 	// delete the table directory
-	err = os.RemoveAll(filepath.Join(d.writePath, name))
+	err := os.RemoveAll(filepath.Join(d.writePath, name))
 	if err != nil {
 		return fmt.Errorf("drop: unable to drop table %q: %w", name, err)
 	}
@@ -544,20 +548,21 @@ func (d *db) DropTable(ctx context.Context, name string) error {
 }
 
 func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
 	d.logger.Info("rename table", slog.String("from", oldName), slog.String("to", newName))
 	if strings.EqualFold(oldName, newName) {
 		return fmt.Errorf("rename: Table with name %q already exists", newName)
 	}
 
-	// sync from backup
-	err := d.syncWrite(ctx)
+	_, release, err := d.acquireWriteConn(ctx) // we don't need the handle but need to sync the write
 	if err != nil {
 		return err
 	}
+	defer release()
 
+	return d.renameTable(ctx, oldName, newName)
+}
+
+func (d *db) renameTable(ctx context.Context, oldName, newName string) error {
 	oldVersion, exist, err := d.writeTableVersion(oldName)
 	if err != nil {
 		return err
@@ -617,10 +622,17 @@ func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
 }
 
 func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
 	d.logger.Info("AddTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", typ))
+	conn, release, err := d.acquireWriteConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return d.addTableColumn(ctx, conn, release, tableName, columnName, typ)
+}
+
+func (d *db) addTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, tableName, columnName, typ string) error {
 	version, exist, err := tableVersion(d.writePath, tableName)
 	if err != nil {
 		return err
@@ -630,14 +642,8 @@ func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ stri
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
 
-	writeHandle, err := d.acquireWriteHandle(ctx)
-	if err != nil {
-		return err
-	}
-
 	d.writeDirty = true
-	_, err = writeHandle.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s.default ADD COLUMN %s %s", safeSQLName(dbName(tableName)), safeSQLName(columnName), typ))
-	writeHandle.Close()
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s.default ADD COLUMN %s %s", safeSQLName(dbName(tableName)), safeSQLName(columnName), typ))
 	if err != nil {
 		return err
 	}
@@ -651,6 +657,11 @@ func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ stri
 
 	// update version.txt
 	err = os.WriteFile(filepath.Join(d.writePath, tableName, "version.txt"), []byte(newVersion), fs.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	err = releaseConn()
 	if err != nil {
 		return err
 	}
@@ -661,15 +672,22 @@ func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ stri
 		return err
 	}
 	d.writeDirty = false
-	return nil
+	return d.Sync(ctx)
 }
 
 // AlterTableColumn implements drivers.OLAPStore.
 func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-
 	d.logger.Info("AlterTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", newType))
+	conn, release, err := d.acquireWriteConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return d.alterTableColumn(ctx, conn, release, tableName, columnName, newType)
+}
+
+func (d *db) alterTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, tableName, columnName, newType string) error {
 	version, exist, err := tableVersion(d.writePath, tableName)
 	if err != nil {
 		return err
@@ -679,14 +697,8 @@ func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newTyp
 		return fmt.Errorf("table %q does not exist", tableName)
 	}
 
-	writeHandle, err := d.acquireWriteHandle(ctx)
-	if err != nil {
-		return err
-	}
-
 	d.writeDirty = true
-	_, err = writeHandle.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s.default ALTER %s TYPE %s", safeSQLName(dbName(tableName)), safeSQLName(columnName), newType))
-	writeHandle.Close()
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s.default ALTER %s TYPE %s", safeSQLName(dbName(tableName)), safeSQLName(columnName), newType))
 	if err != nil {
 		return err
 	}
@@ -700,6 +712,11 @@ func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newTyp
 
 	// update version.txt
 	err = os.WriteFile(filepath.Join(d.writePath, tableName, "version.txt"), []byte(newVersion), fs.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	err = releaseConn()
 	if err != nil {
 		return err
 	}
@@ -795,15 +812,37 @@ func (d *db) Sync(ctx context.Context) error {
 	return nil
 }
 
-// acquireWriteHandle syncs the write database and initializes the write handle.
-// Should be called only with writeMu locked.
-func (d *db) acquireWriteHandle(ctx context.Context) (*sqlx.DB, error) {
+// acquireWriteConn syncs the write database, initializes the write handle and returns a write connection.
+func (d *db) acquireWriteConn(ctx context.Context) (*sqlx.Conn, func() error, error) {
+	d.writeMu.Lock()
 	err := d.syncWrite(ctx)
 	if err != nil {
-		return nil, err
+		d.writeMu.Unlock()
+		return nil, nil, err
 	}
 
-	return d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
+	db, err := d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
+	if err != nil {
+		d.writeMu.Unlock()
+		return nil, nil, err
+	}
+	conn, err := db.Connx(ctx)
+	if err != nil {
+		_ = db.Close()
+		d.writeMu.Unlock()
+		return nil, nil, err
+	}
+	release := false
+	return conn, func() error {
+		if release { // make release idempotent
+			return nil
+		}
+		_ = conn.Close()
+		err = db.Close()
+		d.writeMu.Unlock()
+		release = true
+		return err
+	}, nil
 }
 
 func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[string]string, read bool) (*sqlx.DB, error) {
@@ -1015,23 +1054,16 @@ func (d *db) writeTableVersion(name string) (string, bool, error) {
 	return tableVersion(d.writePath, name)
 }
 
-func execIncrementalInsert(ctx context.Context, h *sqlx.DB, name, sql string, opts *InsertTableOptions) error {
+func execIncrementalInsert(ctx context.Context, conn *sqlx.Conn, safeTableName, sql string, opts *InsertTableOptions) error {
 	var byNameClause string
 	if opts.ByName {
 		byNameClause = "BY NAME"
 	}
 
-	safeName := fmt.Sprintf("%s.default", safeSQLName(dbName(name)))
 	if opts.Strategy == IncrementalStrategyAppend {
-		_, err := h.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s (%s\n)", safeName, byNameClause, sql))
+		_, err := conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s (%s\n)", safeTableName, byNameClause, sql))
 		return err
 	}
-
-	conn, err := h.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
 
 	if opts.Strategy == IncrementalStrategyMerge {
 		// Create a temporary table with the new data
@@ -1063,13 +1095,13 @@ func execIncrementalInsert(ctx context.Context, h *sqlx.DB, name, sql string, op
 			}
 			where += fmt.Sprintf("base.%s IS NOT DISTINCT FROM tmp.%s", key, key)
 		}
-		_, err = conn.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s base WHERE EXISTS (SELECT 1 FROM %s tmp WHERE %s)", safeName, safeSQLName(tmp), where))
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s base WHERE EXISTS (SELECT 1 FROM %s tmp WHERE %s)", safeTableName, safeSQLName(tmp), where))
 		if err != nil {
 			return err
 		}
 
 		// Insert the new data into the target table
-		_, err = conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s SELECT * FROM %s", safeName, byNameClause, safeSQLName(tmp)))
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s SELECT * FROM %s", safeTableName, byNameClause, safeSQLName(tmp)))
 		return err
 	}
 

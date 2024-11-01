@@ -29,19 +29,16 @@ func TestDB(t *testing.T) {
 	require.NoError(t, err)
 
 	// query table
-	rows, release, err := db.Query(ctx, "SELECT id, country FROM test")
-	require.NoError(t, err)
-
 	var (
 		id      int
 		country string
 	)
-	require.True(t, rows.Next())
-	require.NoError(t, rows.Scan(&id, &country))
+	conn, release, err := db.AcquireReadConnection(ctx)
+	require.NoError(t, err)
+	err = conn.Connx().QueryRowxContext(ctx, "SELECT id, country FROM test").Scan(&id, &country)
+	require.NoError(t, err)
 	require.Equal(t, 1, id)
 	require.Equal(t, "India", country)
-	require.False(t, rows.Next())
-	require.NoError(t, rows.Err())
 	require.NoError(t, release())
 
 	// rename table
@@ -64,14 +61,12 @@ func TestDB(t *testing.T) {
 	require.NoError(t, err)
 
 	// query table
-	rows, release, err = db.Query(ctx, "SELECT id, country FROM test2 where id = 2")
+	conn, release, err = db.AcquireReadConnection(ctx)
 	require.NoError(t, err)
-	require.True(t, rows.Next())
-	require.NoError(t, rows.Scan(&id, &country))
+	err = conn.Connx().QueryRowxContext(ctx, "SELECT id, country FROM test2 where id = 2").Scan(&id, &country)
+	require.NoError(t, err)
 	require.Equal(t, 2, id)
 	require.Equal(t, "USA", country)
-	require.False(t, rows.Next())
-	require.NoError(t, rows.Err())
 	require.NoError(t, release())
 
 	// Add column

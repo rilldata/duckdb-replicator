@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/XSAM/otelsql"
 	"github.com/jmoiron/sqlx"
@@ -16,8 +18,9 @@ import (
 )
 
 type singledb struct {
-	db     *sqlx.DB
-	logger *slog.Logger
+	db      *sqlx.DB
+	writeMU *sync.Mutex
+	logger  *slog.Logger
 }
 
 type SingleDBOptions struct {
@@ -77,6 +80,7 @@ func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
 
 	err = otelsql.RegisterDBStatsMetrics(db.DB, otelsql.WithAttributes(attribute.String("db.system", "duckdb")))
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("registering db stats metrics: %w", err)
 	}
 
@@ -85,78 +89,19 @@ func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
 		db.Close()
 		return nil, err
 	}
-	return &singledb{
-		db:     db,
-		logger: opts.Logger,
-	}, nil
-}
-
-// AcquireReadConnection implements DB.
-func (s *singledb) AcquireReadConnection(ctx context.Context) (conn *sqlx.Conn, release func() error, err error) {
-	conn, err = s.db.Connx(ctx)
-	if err != nil {
-		return nil, nil, err
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
-
-	return conn, conn.Close, nil
-}
-
-// AddTableColumn implements DB.
-func (s *singledb) AddTableColumn(ctx context.Context, tableName string, columnName string, typ string) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", safeSQLString(tableName), safeSQLName(columnName), typ))
-	return err
-}
-
-// AlterTableColumn implements DB.
-func (s *singledb) AlterTableColumn(ctx context.Context, tableName string, columnName string, newType string) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s", safeSQLName(tableName), safeSQLName(columnName), newType))
-	return err
+	return &singledb{
+		db:      db,
+		writeMU: &sync.Mutex{},
+		logger:  opts.Logger,
+	}, nil
 }
 
 // Close implements DB.
 func (s *singledb) Close() error {
 	return s.db.Close()
-}
-
-// CreateTableAsSelect implements DB.
-func (s *singledb) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
-	var typ string
-	if opts != nil && opts.View {
-		typ = "VIEW"
-	} else {
-		typ = "TABLE"
-	}
-
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE %s %s AS (%s\n)", typ, safeSQLName(name), sql))
-	return err
-}
-
-// DropTable implements DB.
-func (s *singledb) DropTable(ctx context.Context, name string) error {
-	view, err := s.isView(ctx, name)
-	if err != nil {
-		return err
-	}
-	var typ string
-	if view {
-		typ = "VIEW"
-	} else {
-		typ = "TABLE"
-	}
-
-	_, err = s.db.ExecContext(ctx, fmt.Sprintf("DROP %s %s", typ, safeSQLName(name)))
-	return err
-}
-
-// InsertTableAsSelect implements DB.
-func (s *singledb) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
-	if opts == nil {
-		opts = &InsertTableOptions{
-			Strategy: IncrementalStrategyAppend,
-		}
-	}
-
-	return execIncrementalInsert(ctx, s.db, name, sql, opts)
 }
 
 // Query implements DB.
@@ -169,9 +114,112 @@ func (s *singledb) Query(ctx context.Context, query string, args ...any) (res *s
 	return res, res.Close, nil
 }
 
-// RenameTable implements DB.
-func (s *singledb) RenameTable(ctx context.Context, oldName string, newName string) error {
-	view, err := s.isView(ctx, oldName)
+// AcquireReadConnection implements DB.
+func (s *singledb) AcquireReadConnection(ctx context.Context) (Conn, func() error, error) {
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &singledbConn{
+		Conn: conn,
+		db:   s,
+	}, conn.Close, nil
+}
+
+func (s *singledb) AcquireWriteConnection(ctx context.Context) (Conn, func() error, error) {
+	s.writeMU.Lock()
+	c, err := s.db.Connx(ctx)
+	if err != nil {
+		s.writeMU.Unlock()
+		return nil, nil, err
+	}
+
+	return &singledbConn{
+			Conn: c,
+			db:   s,
+		}, func() error {
+			s.writeMU.Unlock()
+			return c.Close()
+		}, nil
+}
+
+// AddTableColumn implements DB.
+func (s *singledb) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.addTableColumn(ctx, conn, tableName, columnName, typ)
+}
+
+func (s *singledb) addTableColumn(ctx context.Context, conn *sqlx.Conn, tableName, columnName, typ string) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", safeSQLString(tableName), safeSQLName(columnName), typ))
+	return err
+}
+
+// AlterTableColumn implements DB.
+func (s *singledb) AlterTableColumn(ctx context.Context, tableName string, columnName string, newType string) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.alterTableColumn(ctx, conn, tableName, columnName, newType)
+}
+
+func (s *singledb) alterTableColumn(ctx context.Context, conn *sqlx.Conn, tableName, columnName, newType string) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s", safeSQLName(tableName), safeSQLName(columnName), newType))
+	return err
+}
+
+// CreateTableAsSelect implements DB.
+func (s *singledb) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.createTableAsSelect(ctx, conn, name, sql, opts)
+}
+
+func (s *singledb) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, name, sql string, opts *CreateTableOptions) error {
+	var typ string
+	if opts != nil && opts.View {
+		typ = "VIEW"
+	} else {
+		typ = "TABLE"
+	}
+
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE %s %s AS (%s\n)", typ, safeSQLName(name), sql))
+	return err
+}
+
+// DropTable implements DB.
+func (s *singledb) DropTable(ctx context.Context, name string) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.dropTable(ctx, conn, name)
+}
+
+func (s *singledb) dropTable(ctx context.Context, conn *sqlx.Conn, name string) error {
+	view, err := isView(ctx, conn, name)
 	if err != nil {
 		return err
 	}
@@ -182,7 +230,55 @@ func (s *singledb) RenameTable(ctx context.Context, oldName string, newName stri
 		typ = "TABLE"
 	}
 
-	_, err = s.db.ExecContext(ctx, fmt.Sprintf("ALTER %s %s RENAME TO %s", typ, safeSQLName(oldName), safeSQLName(newName)))
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("DROP %s %s", typ, safeSQLName(name)))
+	return err
+}
+
+// InsertTableAsSelect implements DB.
+func (s *singledb) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	if opts == nil {
+		opts = &InsertTableOptions{
+			Strategy: IncrementalStrategyAppend,
+		}
+	}
+	return execIncrementalInsert(ctx, conn, safeSQLName(name), sql, opts)
+}
+
+// RenameTable implements DB.
+func (s *singledb) RenameTable(ctx context.Context, oldName string, newName string) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.renameTable(ctx, conn, oldName, newName)
+}
+
+func (s *singledb) renameTable(ctx context.Context, conn *sqlx.Conn, oldName, newName string) error {
+
+	view, err := isView(ctx, conn, oldName)
+	if err != nil {
+		return err
+	}
+	var typ string
+	if view {
+		typ = "VIEW"
+	} else {
+		typ = "TABLE"
+	}
+
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("ALTER %s %s RENAME TO %s", typ, safeSQLName(oldName), safeSQLName(newName)))
 	return err
 }
 
@@ -191,9 +287,9 @@ func (s *singledb) Sync(ctx context.Context) error {
 	return nil
 }
 
-func (s *singledb) isView(ctx context.Context, name string) (bool, error) {
+func isView(ctx context.Context, conn *sqlx.Conn, name string) (bool, error) {
 	var view bool
-	err := s.db.QueryRowxContext(ctx, `
+	err := conn.QueryRowxContext(ctx, `
 		SELECT 
 			UPPER(table_type) = 'VIEW' 
 		FROM 
