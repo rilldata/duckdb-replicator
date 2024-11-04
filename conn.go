@@ -44,11 +44,19 @@ func (c *conn) Connx() *sqlx.Conn {
 }
 
 func (c *conn) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+	if opts == nil {
+		opts = &CreateTableOptions{}
+	}
 	return c.db.createTableAsSelect(ctx, c.Conn, func() error { return nil }, name, sql, opts)
 }
 
 // InsertTableAsSelect inserts the results of the given SQL query into the table.
 func (c *conn) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+	if opts == nil {
+		opts = &InsertTableOptions{
+			Strategy: IncrementalStrategyAppend,
+		}
+	}
 	return c.db.insertTableAsSelect(ctx, c.Conn, func() error { return nil }, name, sql, opts)
 }
 

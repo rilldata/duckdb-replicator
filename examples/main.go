@@ -23,7 +23,6 @@ func main() {
 	dbOptions := &duckdbreplicator.DBOptions{
 		LocalPath:      "<local-path>",
 		BackupProvider: backup,
-		BackupFormat:   duckdbreplicator.BackupFormatDB,
 		ReadSettings:   map[string]string{"memory_limit": "2GB", "threads": "1"},
 		WriteSettings:  map[string]string{"memory_limit": "8GB", "threads": "2"},
 		InitQueries:    []string{"SET autoinstall_known_extensions=true", "SET autoload_known_extensions=true"},

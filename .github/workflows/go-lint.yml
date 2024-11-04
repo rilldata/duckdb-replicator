@@ -1,0 +1,27 @@
+name: golangci-lint
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/go-lint.yml"
+      - ".golangci.yml"
+      - "go.mod"
+      - "**.go"
+permissions:
+  contents: read
+  checks: write # For code annotations
+jobs:
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.22
+      - name: Go report card
+        uses: creekorful/goreportcard-action@v1.0
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.59

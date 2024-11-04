@@ -74,9 +74,6 @@ type DBOptions struct {
 
 	BackupProvider *BackupProvider
 
-	// BackupFormat is the format to use when backing up the database.
-	BackupFormat BackupFormat
-
 	// ReadSettings are settings applied the read duckDB handle.
 	ReadSettings map[string]string
 	// WriteSettings are settings applied the write duckDB handle.
@@ -362,7 +359,6 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 }
 
 func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, sql string, opts *CreateTableOptions) error {
-
 	// check if some older version exists
 	oldVersion, oldVersionExists, _ := tableVersion(d.writePath, name)
 	d.logger.Info("old version", slog.String("version", oldVersion), slog.Bool("exists", oldVersionExists))

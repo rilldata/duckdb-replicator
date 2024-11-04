@@ -236,6 +236,11 @@ func (s *singledb) dropTable(ctx context.Context, conn *sqlx.Conn, name string) 
 
 // InsertTableAsSelect implements DB.
 func (s *singledb) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+	if opts == nil {
+		opts = &InsertTableOptions{
+			Strategy: IncrementalStrategyAppend,
+		}
+	}
 	s.writeMU.Lock()
 	defer s.writeMU.Unlock()
 
