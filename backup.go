@@ -119,7 +119,7 @@ func (d *db) syncWrite(ctx context.Context) error {
 			// invalid table directory
 			// TODO :: differ between not found and other errors
 			d.logger.Warn("SyncWithObjectStorage: invalid table directory", slog.String("table", table))
-			d.deleteBackup(ctx, table, "")
+			_ = d.deleteBackup(ctx, table, "")
 			continue
 		}
 		backedUpVersion := string(res)

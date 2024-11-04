@@ -58,3 +58,40 @@ func TestSingleDB_test(t *testing.T) {
 	err = db.DropTable(ctx, "test")
 	require.NoError(t, err)
 }
+
+func TestSingleDB_testRenameExisting(t *testing.T) {
+	ctx := context.Background()
+	db, err := NewSingleDB(ctx, &SingleDBOptions{
+		DSN: "",
+	})
+	require.NoError(t, err)
+
+	// create table
+	err = db.CreateTableAsSelect(ctx, "test-2", "SELECT 1 AS id, 'India' AS country", nil)
+	require.NoError(t, err)
+
+	// create another table
+	err = db.CreateTableAsSelect(ctx, "test-3", "SELECT 2 AS id, 'USA' AS country", nil)
+	require.NoError(t, err)
+
+	// rename table
+	err = db.RenameTable(ctx, "test-2", "test-3")
+	require.NoError(t, err)
+
+	// select from table
+	conn, release, err := db.AcquireReadConnection(ctx)
+	require.NoError(t, err)
+
+	var (
+		id      int
+		country string
+	)
+
+	err = conn.Connx().QueryRowxContext(ctx, "SELECT id, country FROM \"test-3\" WHERE id = 1").Scan(&id, &country)
+	require.NoError(t, err)
+	require.Equal(t, 1, id)
+	require.Equal(t, "India", country)
+
+	err = release()
+	require.NoError(t, err)
+}

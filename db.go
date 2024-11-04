@@ -42,9 +42,6 @@ type DB interface {
 	// Any persistent changes to the database should be done by calling CRUD APIs only.
 	AcquireWriteConnection(ctx context.Context) (conn Conn, release func() error, err error)
 
-	// Sync synchronizes the database with the cloud storage.
-	Sync(ctx context.Context) error
-
 	// CRUD APIs
 
 	// CreateTableAsSelect creates a new table by name from the results of the given SQL query.
@@ -80,8 +77,6 @@ type DBOptions struct {
 	WriteSettings map[string]string
 	// InitQueries are the queries to run when the database is first created.
 	InitQueries []string
-
-	StableSelect bool
 
 	// LogLevel for the logs. Default: "debug".
 	Logger *slog.Logger
@@ -271,7 +266,7 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	}
 
 	// sync read path
-	err = db.Sync(ctx)
+	err = db.syncRead(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +349,9 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer func() {
+		_ = release()
+	}()
 	return d.createTableAsSelect(ctx, conn, release, name, sql, opts)
 }
 
@@ -443,7 +440,7 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 	}
 	// both backups and write are now in sync
 	d.writeDirty = false
-	return d.Sync(ctx)
+	return d.syncRead(ctx)
 }
 
 func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
@@ -458,7 +455,10 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 	if err != nil {
 		return err
 	}
-	defer release()
+
+	defer func() {
+		_ = release()
+	}()
 	return d.insertTableAsSelect(ctx, conn, release, name, sql, opts)
 }
 
@@ -505,7 +505,7 @@ func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 	// Delete the old version (ignoring errors since source the new data has already been correctly inserted)
 	_ = os.RemoveAll(oldVersionDir)
 	_ = d.deleteBackup(ctx, name, oldVersion)
-	return d.Sync(ctx)
+	return d.syncRead(ctx)
 }
 
 // DropTable implements DB.
@@ -515,7 +515,9 @@ func (d *db) DropTable(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer func() {
+		_ = release()
+	}()
 
 	return d.dropTable(ctx, name)
 }
@@ -540,7 +542,7 @@ func (d *db) dropTable(ctx context.Context, name string) error {
 	}
 	// both backups and write are now in sync
 	d.writeDirty = false
-	return d.Sync(ctx)
+	return d.syncRead(ctx)
 }
 
 func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
@@ -553,8 +555,9 @@ func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
 	if err != nil {
 		return err
 	}
-	defer release()
-
+	defer func() {
+		_ = release()
+	}()
 	return d.renameTable(ctx, oldName, newName)
 }
 
@@ -614,7 +617,7 @@ func (d *db) renameTable(ctx context.Context, oldName, newName string) error {
 		return fmt.Errorf("rename: unable to replicate new table")
 	}
 	d.writeDirty = false
-	return d.Sync(ctx)
+	return d.syncRead(ctx)
 }
 
 func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
@@ -623,7 +626,9 @@ func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ stri
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer func() {
+		_ = release()
+	}()
 
 	return d.addTableColumn(ctx, conn, release, tableName, columnName, typ)
 }
@@ -668,7 +673,7 @@ func (d *db) addTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn fu
 		return err
 	}
 	d.writeDirty = false
-	return d.Sync(ctx)
+	return d.syncRead(ctx)
 }
 
 // AlterTableColumn implements drivers.OLAPStore.
@@ -678,7 +683,9 @@ func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newTyp
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer func() {
+		_ = release()
+	}()
 
 	return d.alterTableColumn(ctx, conn, release, tableName, columnName, newType)
 }
@@ -723,11 +730,10 @@ func (d *db) alterTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn 
 		return err
 	}
 	d.writeDirty = false
-	return nil
+	return d.syncRead(ctx)
 }
 
-// Sync implements DB.
-func (d *db) Sync(ctx context.Context) error {
+func (d *db) syncRead(ctx context.Context) error {
 	entries, err := os.ReadDir(d.writePath)
 	if err != nil {
 		return err
@@ -991,12 +997,7 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 				continue
 			}
 
-			sql, err := d.generateSelectQuery(ctx, db, dbName)
-			if err != nil {
-				return err
-			}
-
-			_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS %s", safeSQLName(entry.Name()), sql))
+			_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS SELECT * FROM %s.default", safeSQLName(entry.Name()), safeSQLName(dbName)))
 			if err != nil {
 				return err
 			}
@@ -1014,32 +1015,6 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 		}
 	}
 	return nil
-}
-
-func (d *db) generateSelectQuery(ctx context.Context, handle *sqlx.DB, dbName string) (string, error) {
-	if !d.opts.StableSelect {
-		return fmt.Sprintf("SELECT * FROM %s.default", dbName), nil
-	}
-	rows, err := handle.QueryContext(ctx, `
-			SELECT column_name AS name
-			FROM information_schema.columns
-			WHERE table_catalog = ? AND table_name = 'default'
-			ORDER BY name ASC`, dbName)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-
-	cols := make([]string, 0)
-	var col string
-	for rows.Next() {
-		if err := rows.Scan(&col); err != nil {
-			return "", err
-		}
-		cols = append(cols, safeSQLName(col))
-	}
-
-	return fmt.Sprintf("SELECT %s FROM %s.default", strings.Join(cols, ", "), safeSQLName(dbName)), nil
 }
 
 func (d *db) readTableVersion(name string) (string, bool, error) {

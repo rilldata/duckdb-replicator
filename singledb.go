@@ -2,7 +2,9 @@ package duckdbreplicator
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -271,11 +273,11 @@ func (s *singledb) RenameTable(ctx context.Context, oldName string, newName stri
 }
 
 func (s *singledb) renameTable(ctx context.Context, conn *sqlx.Conn, oldName, newName string) error {
-
 	view, err := isView(ctx, conn, oldName)
 	if err != nil {
 		return err
 	}
+
 	var typ string
 	if view {
 		typ = "VIEW"
@@ -283,13 +285,31 @@ func (s *singledb) renameTable(ctx context.Context, conn *sqlx.Conn, oldName, ne
 		typ = "TABLE"
 	}
 
+	newNameIsView, err := isView(ctx, conn, newName)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// The newName does not exist.
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("ALTER %s %s RENAME TO %s", typ, safeSQLName(oldName), safeSQLName(newName)))
+		return err
+	}
+
+	// The newName is already occupied.
+	var existingTyp string
+	if newNameIsView {
+		existingTyp = "VIEW"
+	} else {
+		existingTyp = "TABLE"
+	}
+
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("DROP %s IF EXISTS %s", existingTyp, safeSQLName(newName)))
+	if err != nil {
+		return err
+	}
+
 	_, err = conn.ExecContext(ctx, fmt.Sprintf("ALTER %s %s RENAME TO %s", typ, safeSQLName(oldName), safeSQLName(newName)))
 	return err
-}
-
-// Sync implements DB.
-func (s *singledb) Sync(ctx context.Context) error {
-	return nil
 }
 
 func isView(ctx context.Context, conn *sqlx.Conn, name string) (bool, error) {
