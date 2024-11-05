@@ -63,18 +63,10 @@ func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
 		return nil
 	})
 	if err != nil {
-		// Check for using incompatible database files
-		if strings.Contains(err.Error(), "Trying to read a database file with version number") {
-			return nil, err
-			// TODO :: fix
-			// return nil, fmt.Errorf("database file %q was created with an older, incompatible version of Rill (please remove it and try again)", c.config.DSN)
+		if strings.Contains(err.Error(), "Symbol not found") {
+			fmt.Printf("Your version of macOS is not supported. Please upgrade to the latest major release of macOS. See this link for details: https://support.apple.com/en-in/macos/upgrade")
+			os.Exit(1)
 		}
-
-		// Check for another process currently accessing the DB
-		if strings.Contains(err.Error(), "Could not set lock on file") {
-			return nil, fmt.Errorf("failed to open database (is Rill already running?): %w", err)
-		}
-
 		return nil, err
 	}
 

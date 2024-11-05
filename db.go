@@ -276,16 +276,6 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	// create read handle
 	db.readHandle, err = db.openDBAndAttach(ctx, true)
 	if err != nil {
-		// Check for using incompatible database files
-		if strings.Contains(err.Error(), "Trying to read a database file with version number") {
-			return nil, fmt.Errorf("database file was created with an older, incompatible version of Rill (please remove `tmp` directory and try again)")
-		}
-
-		// Check for another process currently accessing the DB
-		if strings.Contains(err.Error(), "Could not set lock on file") {
-			return nil, fmt.Errorf("failed to open database (is Rill already running?): %w", err)
-		}
-
 		if strings.Contains(err.Error(), "Symbol not found") {
 			fmt.Printf("Your version of macOS is not supported. Please upgrade to the latest major release of macOS. See this link for details: https://support.apple.com/en-in/macos/upgrade")
 			os.Exit(1)
@@ -990,14 +980,12 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 		if !entry.IsDir() {
 			continue
 		}
-		version, exist, err := tableVersion(path, entry.Name())
-		if err != nil {
-			d.logger.Debug("error in fetching db version", slog.String("table", entry.Name()), slog.Any("error", err))
-			_ = os.RemoveAll(filepath.Join(path, entry.Name()))
-			continue
-		}
+
+		// NOTE :: we always look at the write version
+		// Tables in read path are removed after getting a new handle
+		// So we need to always look at the write version to ensure we do not reattach dropped tables
+		version, exist, _ := d.writeTableVersion(entry.Name())
 		if !exist {
-			_ = os.RemoveAll(filepath.Join(path, entry.Name()))
 			continue
 		}
 		versionPath := filepath.Join(path, entry.Name(), version)
@@ -1031,8 +1019,8 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 			}
 			_, err := db.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s %s", safeSQLString(filepath.Join(versionPath, "data.db")), safeSQLName(dbName), readMode))
 			if err != nil {
-				d.logger.Warn("error in attaching db", slog.String("table", entry.Name()), slog.Any("error", err))
-				_ = os.RemoveAll(versionPath)
+				d.logger.Error("error in attaching db", slog.String("table", entry.Name()), slog.Any("error", err))
+				_ = os.RemoveAll(filepath.Join(path, entry.Name()))
 				return err
 			}
 
