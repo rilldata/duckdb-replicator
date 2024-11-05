@@ -21,7 +21,7 @@ import (
 
 type singledb struct {
 	db      *sqlx.DB
-	writeMU *sync.Mutex
+	writeMU *sync.Mutex // limits write queries to one at a time. Does not block read queries.
 	logger  *slog.Logger
 }
 
@@ -32,8 +32,10 @@ type SingleDBOptions struct {
 	Logger      *slog.Logger
 }
 
+var _ DB = &singledb{}
+
 // NewSingleDB creates a new DB that writes to and reads from a single DuckDB database.
-// This is useful for testing and small datasets.
+// This is useful for testing only.
 func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
 	if opts.Clean {
 		u, err := url.Parse(opts.DSN)
@@ -77,9 +79,6 @@ func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
 	}
 
 	db := sqlx.NewDb(otelsql.OpenDB(connector), "duckdb")
-	// TODO :: Do we need to limit max open connections ?
-	// db.SetMaxOpenConns(c.config.PoolSize)
-
 	err = otelsql.RegisterDBStatsMetrics(db.DB, otelsql.WithAttributes(attribute.String("db.system", "duckdb")))
 	if err != nil {
 		db.Close()
@@ -104,16 +103,6 @@ func NewSingleDB(ctx context.Context, opts *SingleDBOptions) (DB, error) {
 // Close implements DB.
 func (s *singledb) Close() error {
 	return s.db.Close()
-}
-
-// Query implements DB.
-func (s *singledb) Query(ctx context.Context, query string, args ...any) (res *sqlx.Rows, release func() error, err error) {
-	res, err = s.db.QueryxContext(ctx, query, args...)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return res, res.Close, nil
 }
 
 // AcquireReadConnection implements DB.
@@ -145,42 +134,6 @@ func (s *singledb) AcquireWriteConnection(ctx context.Context) (Conn, func() err
 			s.writeMU.Unlock()
 			return err
 		}, nil
-}
-
-// AddTableColumn implements DB.
-func (s *singledb) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
-	s.writeMU.Lock()
-	defer s.writeMU.Unlock()
-
-	conn, err := s.db.Connx(ctx)
-	if err != nil {
-		return err
-	}
-
-	return s.addTableColumn(ctx, conn, tableName, columnName, typ)
-}
-
-func (s *singledb) addTableColumn(ctx context.Context, conn *sqlx.Conn, tableName, columnName, typ string) error {
-	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", safeSQLString(tableName), safeSQLName(columnName), typ))
-	return err
-}
-
-// AlterTableColumn implements DB.
-func (s *singledb) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
-	s.writeMU.Lock()
-	defer s.writeMU.Unlock()
-
-	conn, err := s.db.Connx(ctx)
-	if err != nil {
-		return err
-	}
-
-	return s.alterTableColumn(ctx, conn, tableName, columnName, newType)
-}
-
-func (s *singledb) alterTableColumn(ctx context.Context, conn *sqlx.Conn, tableName, columnName, newType string) error {
-	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s", safeSQLName(tableName), safeSQLName(columnName), newType))
-	return err
 }
 
 // CreateTableAsSelect implements DB.
@@ -313,6 +266,42 @@ func (s *singledb) renameTable(ctx context.Context, conn *sqlx.Conn, oldName, ne
 	return err
 }
 
+// AddTableColumn implements DB.
+func (s *singledb) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.addTableColumn(ctx, conn, tableName, columnName, typ)
+}
+
+func (s *singledb) addTableColumn(ctx context.Context, conn *sqlx.Conn, tableName, columnName, typ string) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", safeSQLString(tableName), safeSQLName(columnName), typ))
+	return err
+}
+
+// AlterTableColumn implements DB.
+func (s *singledb) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
+	s.writeMU.Lock()
+	defer s.writeMU.Unlock()
+
+	conn, err := s.db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.alterTableColumn(ctx, conn, tableName, columnName, newType)
+}
+
+func (s *singledb) alterTableColumn(ctx context.Context, conn *sqlx.Conn, tableName, columnName, newType string) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s", safeSQLName(tableName), safeSQLName(columnName), newType))
+	return err
+}
+
 func isView(ctx context.Context, conn *sqlx.Conn, name string) (bool, error) {
 	var view bool
 	err := conn.QueryRowxContext(ctx, `
@@ -330,5 +319,3 @@ func isView(ctx context.Context, conn *sqlx.Conn, name string) (bool, error) {
 	}
 	return view, nil
 }
-
-var _ DB = &singledb{}

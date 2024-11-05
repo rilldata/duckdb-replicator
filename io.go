@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 )
 
+// copyDir copies a directory from source to destination
+// It recursively copies all the contents of the source directory to the destination directory.
+// Files with the same name in the destination directory will be overwritten.
 func copyDir(dst, src string) error {
 	// Create the destination directory
 	err := os.MkdirAll(dst, os.ModePerm)

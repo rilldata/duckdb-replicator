@@ -14,6 +14,7 @@ import (
 
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/gcsblob"
+	"gocloud.dev/gcerrors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -76,7 +77,7 @@ func (d *db) syncWrite(ctx context.Context) error {
 		// optimisation to skip sync if write was already synced
 		return nil
 	}
-	d.logger.Info("syncing from backup")
+	d.logger.Debug("syncing from backup")
 	// Create an errgroup for background downloads with limited concurrency.
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(8)
@@ -111,24 +112,32 @@ func (d *db) syncWrite(ctx context.Context) error {
 		}
 
 		table := strings.TrimSuffix(obj.Key, "/")
-		d.logger.Info("SyncWithObjectStorage: discovered table", slog.String("table", table))
+		d.logger.Debug("SyncWithObjectStorage: discovered table", slog.String("table", table))
 
 		// get version of the table
-		res, err := d.backup.ReadAll(ctx, filepath.Join(table, "version.txt"))
+		var backedUpVersion string
+		err = retry(func() error {
+			res, err := d.backup.ReadAll(ctx, filepath.Join(table, "version.txt"))
+			if err != nil {
+				return err
+			}
+			backedUpVersion = string(res)
+			return nil
+		})
 		if err != nil {
-			// invalid table directory
-			// TODO :: differ between not found and other errors
-			d.logger.Warn("SyncWithObjectStorage: invalid table directory", slog.String("table", table))
-			_ = d.deleteBackup(ctx, table, "")
-			continue
+			if gcerrors.Code(err) == gcerrors.NotFound {
+				// invalid table directory
+				d.logger.Debug("SyncWithObjectStorage: invalid table directory", slog.String("table", table))
+				_ = d.deleteBackup(ctx, table, "")
+			}
+			return err
 		}
-		backedUpVersion := string(res)
 		tblVersions[table] = backedUpVersion
 
 		// check with current version
 		version, exists, _ := tableVersion(d.writePath, table)
 		if exists && version == backedUpVersion {
-			d.logger.Info("SyncWithObjectStorage: table is already up to date", slog.String("table", table))
+			d.logger.Debug("SyncWithObjectStorage: table is already up to date", slog.String("table", table))
 			continue
 		}
 
@@ -152,7 +161,7 @@ func (d *db) syncWrite(ctx context.Context) error {
 				return err
 			}
 			g.Go(func() error {
-				return retry(5, 10*time.Second, func() error {
+				return retry(func() error {
 					file, err := os.Create(filepath.Join(d.writePath, obj.Key))
 					if err != nil {
 						return err
@@ -210,7 +219,7 @@ func (d *db) syncBackup(ctx context.Context, table string) error {
 	if d.backup == nil {
 		return nil
 	}
-	d.logger.Info("syncing table", slog.String("table", table))
+	d.logger.Debug("syncing table", slog.String("table", table))
 	version, exist, err := tableVersion(d.writePath, table)
 	if err != nil {
 		return err
@@ -227,10 +236,10 @@ func (d *db) syncBackup(ctx context.Context, table string) error {
 	}
 
 	for _, entry := range entries {
-		d.logger.Info("replicating file", slog.String("file", entry.Name()), slog.String("path", path))
+		d.logger.Debug("replicating file", slog.String("file", entry.Name()), slog.String("path", path))
 		// no directory should exist as of now
 		if entry.IsDir() {
-			d.logger.Info("found directory in path which should not exist", slog.String("file", entry.Name()), slog.String("path", path))
+			d.logger.Debug("found directory in path which should not exist", slog.String("file", entry.Name()), slog.String("path", path))
 			continue
 		}
 
@@ -240,7 +249,7 @@ func (d *db) syncBackup(ctx context.Context, table string) error {
 		}
 
 		// upload to cloud storage
-		err = retry(5, 10*time.Second, func() error {
+		err = retry(func() error {
 			return d.backup.Upload(ctx, filepath.Join(table, version, entry.Name()), wr, &blob.WriterOptions{
 				ContentType: "application/octet-stream",
 			})
@@ -252,7 +261,14 @@ func (d *db) syncBackup(ctx context.Context, table string) error {
 	}
 
 	// update version.txt
-	return d.backup.WriteAll(ctx, filepath.Join(table, "version.txt"), []byte(version), nil)
+	// Ideally if this fails it is a non recoverable error but for now we will rely on retries
+	err = retry(func() error {
+		return d.backup.WriteAll(ctx, filepath.Join(table, "version.txt"), []byte(version), nil)
+	})
+	if err != nil {
+		d.logger.Error("failed to update version.txt in backup", slog.Any("error", err))
+	}
+	return err
 }
 
 // deleteBackup deletes backup.
@@ -270,7 +286,14 @@ func (d *db) deleteBackup(ctx context.Context, table, version string) error {
 		if version != "" {
 			prefix = filepath.Join(table, version) + "/"
 		} else {
+			// deleting the entire table
 			prefix = table + "/"
+			// delete version.txt first
+			err := retry(func() error { return d.backup.Delete(ctx, "version.txt") })
+			if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
+				d.logger.Error("failed to delete version.txt in backup", slog.Any("error", err))
+				return err
+			}
 		}
 	}
 
@@ -283,7 +306,7 @@ func (d *db) deleteBackup(ctx context.Context, table, version string) error {
 			}
 			return err
 		}
-		err = retry(5, 10*time.Second, func() error { return d.backup.Delete(ctx, obj.Key) })
+		err = retry(func() error { return d.backup.Delete(ctx, obj.Key) })
 		if err != nil {
 			return err
 		}
@@ -291,17 +314,22 @@ func (d *db) deleteBackup(ctx context.Context, table, version string) error {
 	return nil
 }
 
-func retry(maxRetries int, delay time.Duration, fn func() error) error {
+func retry(fn func() error) error {
 	var err error
-	for i := 0; i < maxRetries; i++ {
+	for i := 0; i < _maxRetries; i++ {
 		err = fn()
 		if err == nil {
 			return nil // success
 		} else if strings.Contains(err.Error(), "stream error: stream ID") {
-			time.Sleep(delay) // retry
+			time.Sleep(_retryDelay) // retry
 		} else {
 			break // return error
 		}
 	}
 	return err
 }
+
+const (
+	_maxRetries = 5
+	_retryDelay = 10 * time.Second
+)

@@ -1,6 +1,6 @@
 module github.com/rilldata/duckdb-replicator
 
-go 1.23.2
+go 1.22.0
 
 require (
 	github.com/XSAM/otelsql v0.27.0

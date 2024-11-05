@@ -1,4 +1,4 @@
-package duckdbreplicator_test
+package duckdbreplicator
 
 import (
 	"context"
@@ -6,14 +6,13 @@ import (
 	"log/slog"
 	"testing"
 
-	duckdbreplicator "github.com/rilldata/duckdb-replicator"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDB(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
-	db, err := duckdbreplicator.NewDB(ctx, "test", &duckdbreplicator.DBOptions{
+	db, err := NewDB(ctx, "test", &DBOptions{
 		LocalPath:      dir,
 		BackupProvider: nil,
 		ReadSettings:   map[string]string{"memory_limit": "2GB", "threads": "1"},
@@ -53,8 +52,8 @@ func TestDB(t *testing.T) {
 	require.NoError(t, err)
 
 	// merge into table
-	err = db.InsertTableAsSelect(ctx, "test2", "SELECT 2 AS id, 'USA' AS country", &duckdbreplicator.InsertTableOptions{
-		Strategy:  duckdbreplicator.IncrementalStrategyMerge,
+	err = db.InsertTableAsSelect(ctx, "test2", "SELECT 2 AS id, 'USA' AS country", &InsertTableOptions{
+		Strategy:  IncrementalStrategyMerge,
 		UniqueKey: []string{"id"},
 	})
 	require.NoError(t, err)

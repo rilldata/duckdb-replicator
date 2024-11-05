@@ -77,7 +77,6 @@ type DBOptions struct {
 	// InitQueries are the queries to run when the database is first created.
 	InitQueries []string
 
-	// LogLevel for the logs. Default: "debug".
 	Logger *slog.Logger
 }
 
@@ -170,7 +169,7 @@ func (d *DBOptions) ValidateSettings() error {
 			return fmt.Errorf("unable to get threads: %w", err)
 		}
 
-		read.Threads = strconv.Itoa(threads / 2)
+		read.Threads = strconv.Itoa((threads + 1) / 2)
 		write.Threads = strconv.Itoa(threads / 2)
 	}
 
@@ -183,7 +182,7 @@ func (d *DBOptions) ValidateSettings() error {
 			threads = writeThread
 		}
 
-		read.Threads = strconv.Itoa(threads / 2)
+		read.Threads = strconv.Itoa((threads + 1) / 2)
 		write.Threads = strconv.Itoa(threads / 2)
 	}
 
@@ -271,8 +270,12 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	}
 
 	// create read handle
-	db.readHandle, err = db.openDBAndAttach(ctx, db.readPath, opts.ReadSettings, true)
+	db.readHandle, err = db.openDBAndAttach(ctx, true)
 	if err != nil {
+		// Check for another process currently accessing the DB
+		if strings.Contains(err.Error(), "Could not set lock on file") {
+			return nil, fmt.Errorf("failed to open database (is Rill already running?): %w", err)
+		}
 		return nil, err
 	}
 
@@ -298,11 +301,11 @@ type db struct {
 var _ DB = &db{}
 
 func (d *db) Close() error {
-	d.readMu.Lock()
-	defer d.readMu.Unlock()
-
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
+
+	d.readMu.Lock()
+	defer d.readMu.Unlock()
 
 	return d.readHandle.Close()
 }
@@ -344,7 +347,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name, query string, opts *
 	if opts == nil {
 		opts = &CreateTableOptions{}
 	}
-	d.logger.Info("create table", slog.String("name", name), slog.Bool("view", opts.View))
+	d.logger.Debug("create table", slog.String("name", name), slog.Bool("view", opts.View))
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
@@ -360,7 +363,7 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name, query string, opts *
 func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, query string, opts *CreateTableOptions) error {
 	// check if some older version exists
 	oldVersion, oldVersionExists, _ := tableVersion(d.writePath, name)
-	d.logger.Info("old version", slog.String("version", oldVersion), slog.Bool("exists", oldVersionExists))
+	d.logger.Debug("old version", slog.String("version", oldVersion), slog.Bool("exists", oldVersionExists))
 
 	// create new version directory
 	newVersion := newVersion()
@@ -402,7 +405,6 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE TABLE %s.default AS (%s\n)", safeDBName, query), nil)
 		if err != nil {
 			_ = os.RemoveAll(newVersionDir)
-			_, _ = conn.ExecContext(ctx, fmt.Sprintf("DETACH DATABASE %s", safeDBName))
 			return fmt.Errorf("create: create %q.default table failed: %w", safeDBName, err)
 		}
 
@@ -420,6 +422,7 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 	// update version.txt
 	err = os.WriteFile(filepath.Join(d.writePath, name, "version.txt"), []byte(newVersion), fs.ModePerm)
 	if err != nil {
+		_ = os.RemoveAll(newVersionDir)
 		return fmt.Errorf("create: write version file failed: %w", err)
 	}
 
@@ -430,18 +433,15 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 	}
 
 	if err := d.syncBackup(ctx, name); err != nil {
-		// A minor optimisation to revert to earlier version can be done
-		// but let syncFromBackup handle since we mark writeDirty as true
 		return fmt.Errorf("create: replicate failed: %w", err)
 	}
-	d.logger.Info("table created", slog.String("name", name))
-
+	d.logger.Debug("table created", slog.String("name", name))
+	// both backups and write are now in sync
+	d.writeDirty = false
 	if oldVersionExists {
 		_ = os.RemoveAll(filepath.Join(d.writePath, name, oldVersion))
 		_ = d.deleteBackup(ctx, name, oldVersion)
 	}
-	// both backups and write are now in sync
-	d.writeDirty = false
 	return d.syncRead(ctx)
 }
 
@@ -452,7 +452,7 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name, query string, opts *
 		}
 	}
 
-	d.logger.Info("insert table", slog.String("name", name), slog.Group("option", "by_name", opts.ByName, "strategy", string(opts.Strategy), "unique_key", opts.UniqueKey))
+	d.logger.Debug("insert table", slog.String("name", name), slog.Group("option", "by_name", opts.ByName, "strategy", string(opts.Strategy), "unique_key", opts.UniqueKey))
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
@@ -514,10 +514,10 @@ func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 
 // DropTable implements DB.
 func (d *db) DropTable(ctx context.Context, name string) error {
-	d.logger.Info("drop table", slog.String("name", name))
+	d.logger.Debug("drop table", slog.String("name", name))
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
-	_, release, err := d.acquireWriteConn(ctx) // we don't need the handle but need to sync the write pah
+	_, release, err := d.acquireWriteConn(ctx) // we don't need the handle but need to sync the write
 	if err != nil {
 		return err
 	}
@@ -535,16 +535,16 @@ func (d *db) dropTable(ctx context.Context, name string) error {
 	}
 
 	d.writeDirty = true
-	// delete the table directory
-	err := os.RemoveAll(filepath.Join(d.writePath, name))
-	if err != nil {
-		return fmt.Errorf("drop: unable to drop table %q: %w", name, err)
-	}
-
 	// drop the table from backup location
-	err = d.deleteBackup(ctx, name, "")
+	err := d.deleteBackup(ctx, name, "")
 	if err != nil {
 		return fmt.Errorf("drop: unable to drop table %q from backup: %w", name, err)
+	}
+
+	// delete the table directory
+	err = os.RemoveAll(filepath.Join(d.writePath, name))
+	if err != nil {
+		return fmt.Errorf("drop: unable to drop table %q: %w", name, err)
 	}
 	// both backups and write are now in sync
 	d.writeDirty = false
@@ -552,7 +552,7 @@ func (d *db) dropTable(ctx context.Context, name string) error {
 }
 
 func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
-	d.logger.Info("rename table", slog.String("from", oldName), slog.String("to", newName))
+	d.logger.Debug("rename table", slog.String("from", oldName), slog.String("to", newName))
 	if strings.EqualFold(oldName, newName) {
 		return fmt.Errorf("rename: Table with name %q already exists", newName)
 	}
@@ -577,58 +577,48 @@ func (d *db) renameTable(ctx context.Context, oldName, newName string) error {
 		return fmt.Errorf("rename: Table %q not found", oldName)
 	}
 
-	oldVersionInNewDir, replaceInNewTable, err := d.writeTableVersion(newName)
+	newTableVersion, replaceInNewTable, _ := d.writeTableVersion(newName)
+
+	d.writeDirty = true
+	err = os.RemoveAll(filepath.Join(d.writePath, newName))
 	if err != nil {
-		return err
-	}
-	if !replaceInNewTable {
-		err = os.Mkdir(filepath.Join(d.writePath, newName), fs.ModePerm)
-		if err != nil {
-			return err
-		}
+		return fmt.Errorf("rename: unable to delete existing new table: %w", err)
 	}
 
-	newVersion := fmt.Sprint(time.Now().UnixMilli())
-	d.writeDirty = true
-	err = os.Rename(filepath.Join(d.writePath, oldName, oldVersion), filepath.Join(d.writePath, newName, newVersion))
+	err = os.Rename(filepath.Join(d.writePath, oldName), filepath.Join(d.writePath, newName))
 	if err != nil {
 		return fmt.Errorf("rename: rename file failed: %w", err)
 	}
 
-	writeErr := os.WriteFile(filepath.Join(d.writePath, newName, "version.txt"), []byte(newVersion), fs.ModePerm)
+	// rename to a new version
+	version := newVersion()
+	err = os.Rename(filepath.Join(d.writePath, newName, oldVersion), filepath.Join(d.writePath, newName, version))
+	if err != nil {
+		return fmt.Errorf("rename: rename version failed: %w", err)
+	}
+
+	// update version.txt
+	writeErr := os.WriteFile(filepath.Join(d.writePath, newName, "version.txt"), []byte(newVersion()), fs.ModePerm)
 	if writeErr != nil {
 		return fmt.Errorf("rename: write version file failed: %w", writeErr)
 	}
 
-	err = os.RemoveAll(filepath.Join(d.writePath, oldName))
-	if err != nil {
-		d.logger.Error("rename: unable to delete old path", slog.Any("error", err))
-	}
-
-	if replaceInNewTable {
-		// new table had some other file previously
-		err = os.RemoveAll(filepath.Join(d.writePath, newName, oldVersionInNewDir))
-		if err != nil {
-			d.logger.Error("rename: unable to delete old version of new table", slog.Any("error", err))
-		}
-		err = d.deleteBackup(ctx, newName, oldVersionInNewDir)
-		if err != nil {
-			d.logger.Error("rename: unable to delete old version of new table from backup", slog.Any("error", err))
-		}
-	}
-	err = d.deleteBackup(ctx, oldName, "")
-	if err != nil {
-		d.logger.Error("rename: unable to delete old table from backup", slog.Any("error", err))
-	}
 	if d.syncBackup(ctx, newName) != nil {
 		return fmt.Errorf("rename: unable to replicate new table")
 	}
+	err = d.deleteBackup(ctx, oldName, "")
+	if err != nil {
+		return fmt.Errorf("rename: unable to delete old table %q from backup: %w", oldName, err)
+	}
 	d.writeDirty = false
+	if replaceInNewTable {
+		_ = d.deleteBackup(ctx, newName, newTableVersion)
+	}
 	return d.syncRead(ctx)
 }
 
 func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
-	d.logger.Info("AddTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", typ))
+	d.logger.Debug("AddTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", typ))
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
@@ -659,7 +649,7 @@ func (d *db) addTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn fu
 	}
 
 	// rename to new version
-	newVersion := fmt.Sprint(time.Now().UnixMilli())
+	newVersion := newVersion()
 	err = os.Rename(filepath.Join(d.writePath, tableName, version), filepath.Join(d.writePath, tableName, newVersion))
 	if err != nil {
 		return err
@@ -682,12 +672,14 @@ func (d *db) addTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn fu
 		return err
 	}
 	d.writeDirty = false
+	// remove old version
+	_ = d.deleteBackup(ctx, tableName, version)
 	return d.syncRead(ctx)
 }
 
 // AlterTableColumn implements drivers.OLAPStore.
 func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
-	d.logger.Info("AlterTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", newType))
+	d.logger.Debug("AlterTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", newType))
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
@@ -741,6 +733,8 @@ func (d *db) alterTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn 
 		return err
 	}
 	d.writeDirty = false
+	// remove old version
+	_ = d.deleteBackup(ctx, tableName, version)
 	return d.syncRead(ctx)
 }
 
@@ -750,59 +744,31 @@ func (d *db) syncRead(ctx context.Context) error {
 		return err
 	}
 
-	tables := make(map[string]any)
+	tableVersion := make(map[string]string)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		tables[entry.Name()] = nil
 
 		// Check if there is already a table with the same version
 		writeVersion, exist, _ := d.writeTableVersion(entry.Name())
 		if !exist {
 			continue
 		}
+		tableVersion[entry.Name()] = writeVersion
 		readVersion, _, _ := d.readTableVersion(entry.Name())
 		if writeVersion == readVersion {
 			continue
 		}
 
-		readPath := filepath.Join(d.readPath, entry.Name())
-
-		// clear read path
-		err = os.RemoveAll(readPath)
-		if err != nil {
-			return err
-		}
-
-		d.logger.Info("Sync: copying table", slog.String("table", entry.Name()))
-		err = copyDir(readPath, filepath.Join(d.writePath, entry.Name()))
+		d.logger.Debug("Sync: copying table", slog.String("table", entry.Name()))
+		err = copyDir(filepath.Join(d.readPath, entry.Name()), filepath.Join(d.writePath, entry.Name()))
 		if err != nil {
 			return err
 		}
 	}
 
-	// delete data for tables that have been removed from write
-	entries, err = os.ReadDir(d.readPath)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		_, ok := tables[entry.Name()]
-		if ok {
-			continue
-		}
-		d.logger.Info("Sync: removing table", slog.String("table", entry.Name()))
-		err = os.RemoveAll(filepath.Join(d.readPath, entry.Name()))
-		if err != nil {
-			return err
-		}
-	}
-
-	handle, err := d.openDBAndAttach(ctx, d.readPath, d.opts.ReadSettings, true)
+	handle, err := d.openDBAndAttach(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -818,7 +784,45 @@ func (d *db) syncRead(ctx context.Context) error {
 	if oldDBHandle != nil {
 		err = oldDBHandle.Close()
 		if err != nil {
-			d.logger.Error("error in closing old read handle", slog.String("error", err.Error()))
+			d.logger.Warn("error in closing old read handle", slog.String("error", err.Error()))
+		}
+	}
+
+	// delete data for tables/versions that have been removed from write
+	entries, err = os.ReadDir(d.readPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		readVersion, ok, _ := d.readTableVersion(entry.Name())
+		if !ok {
+			// invalid table
+			_ = os.RemoveAll(filepath.Join(d.readPath, entry.Name()))
+			continue
+		}
+
+		writeVersion, ok := tableVersion[entry.Name()]
+		if !ok {
+			// table not in write
+			d.logger.Debug("Sync: removing table", slog.String("table", entry.Name()))
+			err = os.RemoveAll(filepath.Join(d.readPath, entry.Name()))
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
+		if readVersion == writeVersion {
+			continue
+		}
+
+		d.logger.Debug("Sync: removing old version", slog.String("table", entry.Name()), slog.String("version", readVersion))
+		err = os.RemoveAll(filepath.Join(d.readPath, entry.Name(), readVersion))
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -833,7 +837,7 @@ func (d *db) acquireWriteConn(ctx context.Context) (*sqlx.Conn, func() error, er
 		return nil, nil, err
 	}
 
-	db, err := d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
+	db, err := d.openDBAndAttach(ctx, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -849,14 +853,22 @@ func (d *db) acquireWriteConn(ctx context.Context) (*sqlx.Conn, func() error, er
 	}, nil
 }
 
-func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[string]string, read bool) (*sqlx.DB, error) {
+func (d *db) openDBAndAttach(ctx context.Context, read bool) (*sqlx.DB, error) {
 	// open the db
-	var dsn *url.URL
-	var err error
+	var (
+		dsn      *url.URL
+		err      error
+		settings map[string]string
+		path     string
+	)
 	if read {
-		dsn, err = url.Parse("")
+		dsn, err = url.Parse("") // in-memory
+		settings = d.opts.ReadSettings
+		path = d.readPath
 	} else {
+		path = d.writePath
 		dsn, err = url.Parse(filepath.Join(path, "stage.db"))
+		settings = d.opts.WriteSettings
 	}
 	if err != nil {
 		return nil, err
@@ -883,9 +895,7 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 	if err != nil {
 		// Check for using incompatible database files
 		if strings.Contains(err.Error(), "Trying to read a database file with version number") {
-			return nil, err
-			// TODO :: fix
-			// return nil, fmt.Errorf("database file %q was created with an older, incompatible version of Rill (please remove it and try again)", c.config.DSN)
+			return nil, fmt.Errorf("database file was created with an older, incompatible version of Rill (please remove `tmp` directory and try again)")
 		}
 
 		// Check for another process currently accessing the DB
@@ -897,8 +907,6 @@ func (d *db) openDBAndAttach(ctx context.Context, path string, settings map[stri
 	}
 
 	db := sqlx.NewDb(otelsql.OpenDB(connector), "duckdb")
-	// TODO :: Do we need to limit max open connections ?
-	// db.SetMaxOpenConns(c.config.PoolSize)
 
 	err = otelsql.RegisterDBStatsMetrics(db.DB, otelsql.WithAttributes(attribute.String("db.system", "duckdb"), attribute.String("db_identifier", d.dbIdentifier)))
 	if err != nil {
@@ -954,7 +962,7 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 		}
 		version, exist, err := tableVersion(path, entry.Name())
 		if err != nil {
-			d.logger.Error("error in fetching db version", slog.String("table", entry.Name()), slog.Any("error", err))
+			d.logger.Debug("error in fetching db version", slog.String("table", entry.Name()), slog.Any("error", err))
 			_ = os.RemoveAll(filepath.Join(path, entry.Name()))
 			continue
 		}
@@ -968,16 +976,15 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 		f, err := os.ReadFile(filepath.Join(versionPath, "meta.json"))
 		if err != nil {
 			_ = os.RemoveAll(versionPath)
-			d.logger.Error("error in reading meta file", slog.String("table", entry.Name()), slog.Any("error", err))
-			// May be keep it as a config to return error or continue ?
-			continue
+			d.logger.Warn("error in reading meta file", slog.String("table", entry.Name()), slog.Any("error", err))
+			return err
 		}
 		var meta meta
 		err = json.Unmarshal(f, &meta)
 		if err != nil {
 			_ = os.RemoveAll(versionPath)
-			d.logger.Error("error in unmarshalling meta file", slog.String("table", entry.Name()), slog.Any("error", err))
-			continue
+			d.logger.Warn("error in unmarshalling meta file", slog.String("table", entry.Name()), slog.Any("error", err))
+			return err
 		}
 
 		if meta.ViewSQL != "" {
@@ -994,9 +1001,9 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 			}
 			_, err := db.ExecContext(ctx, fmt.Sprintf("ATTACH %s AS %s %s", safeSQLString(filepath.Join(versionPath, "data.db")), safeSQLName(dbName), readMode))
 			if err != nil {
-				d.logger.Error("error in attaching db", slog.String("table", entry.Name()), slog.Any("error", err))
+				d.logger.Warn("error in attaching db", slog.String("table", entry.Name()), slog.Any("error", err))
 				_ = os.RemoveAll(versionPath)
-				continue
+				return err
 			}
 
 			_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS SELECT * FROM %s.default", safeSQLName(entry.Name()), safeSQLName(dbName)))
