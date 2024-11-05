@@ -38,7 +38,7 @@ func copyDir(dst, src string) error {
 	return nil
 }
 
-func copyFile(dst string, src string) error {
+func copyFile(dst, src string) error {
 	// Open the source file
 	srcFile, err := os.Open(src)
 	if err != nil {

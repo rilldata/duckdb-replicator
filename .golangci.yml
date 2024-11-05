@@ -1,0 +1,145 @@
+run:
+  timeout: 10m
+  tests: false
+
+issues:
+  exclude-rules:
+    # Disable some linters for test files
+    - path: _test\.go
+      linters:
+        - gosec
+
+linters:
+  disable-all: true
+  enable:
+    - bidichk
+    - bodyclose
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - gci
+    - gocritic
+    - gofmt
+    - gofumpt
+    - goheader
+    - goprintffuncname
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - revive
+    - staticcheck
+    - stylecheck
+    - tenv
+    - testpackage
+    - tparallel
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - whitespace
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+      - experimental
+      - opinionated
+    disabled-checks:
+      - hugeParam
+      - ifElseChain
+      - unnamedResult
+  gci:
+    sections:
+      - standard
+      - default
+      - blank
+      - dot
+    custom-order: true
+  govet:
+    disable-all: true
+    enable:
+      - asmdecl
+      - assign
+      - atomic
+      - atomicalign
+      - bools
+      - buildtag
+      - cgocall
+      - composites
+      - copylocks
+      - deepequalerrors
+      - errorsas
+      - findcall
+      - framepointer
+      - httpresponse
+      - ifaceassert
+      - loopclosure
+      - lostcancel
+      - nilfunc
+      - nilness
+      - nlreturn
+      - printf
+      - reflectvaluecompare
+      - shift
+      - sigchanyzer
+      - sortslice
+      - stdmethods
+      - stringintconv
+      - structtag
+      - testinggoroutine
+      - tests
+      - unmarshal
+      - unreachable
+      - unsafeptr
+      - unusedresult
+      - unusedwrite
+  gosec:
+    excludes:
+      - G107
+      - G108
+      - G112
+      - G203
+      - G204
+      - G306
+      - G401
+      - G501
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: empty-block
+      - name: error-naming
+      - name: error-return
+      - name: errorf
+      - name: if-return
+      - name: increment-decrement
+      - name: indent-error-flow
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: redefines-builtin-id
+      - name: superfluous-else
+      - name: time-naming
+      - name: unexported-return
+      - name: unreachable-code
+      - name: var-declaration
+      - name: var-naming
+  stylecheck:
+    checks:
+      - "all"
+      - "-ST1000"
+      - "-ST1003"
+      - "-ST1005"
+      - "-ST1016"
+      - "-ST1020"
+      - "-ST1021"
+      - "-ST1022"

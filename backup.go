@@ -278,7 +278,7 @@ func (d *db) deleteBackup(ctx context.Context, table, version string) error {
 	for {
 		obj, err := iter.Next(ctx)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return err

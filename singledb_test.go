@@ -16,24 +16,28 @@ func TestSingleDB_test(t *testing.T) {
 	require.NoError(t, err)
 
 	// create table
-	err = db.CreateTableAsSelect(ctx, "test-2", "SELECT 1 AS id, 'India' AS country", nil)
+	rw, release, err := db.AcquireWriteConnection(ctx)
+	require.NoError(t, err)
+
+	err = rw.CreateTableAsSelect(ctx, "test-2", "SELECT 1 AS id, 'India' AS country", nil)
 	require.NoError(t, err)
 
 	// rename table
-	err = db.RenameTable(ctx, "test-2", "test")
+	err = rw.RenameTable(ctx, "test-2", "test")
 	require.NoError(t, err)
 
 	// insert into table
-	err = db.InsertTableAsSelect(ctx, "test", "SELECT 2 AS id, 'USA' AS country", nil)
+	err = rw.InsertTableAsSelect(ctx, "test", "SELECT 2 AS id, 'USA' AS country", nil)
 	require.NoError(t, err)
 
 	// add column
-	err = db.AddTableColumn(ctx, "test", "currency_score", "INT")
+	err = rw.AddTableColumn(ctx, "test", "currency_score", "INT")
 	require.NoError(t, err)
 
 	// alter column
-	err = db.AlterTableColumn(ctx, "test", "currency_score", "FLOAT")
+	err = rw.AlterTableColumn(ctx, "test", "currency_score", "FLOAT")
 	require.NoError(t, err)
+	require.NoError(t, release())
 
 	// select from table
 	conn, release, err := db.AcquireReadConnection(ctx)

@@ -43,7 +43,7 @@ func (c *conn) Connx() *sqlx.Conn {
 	return c.Conn
 }
 
-func (c *conn) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+func (c *conn) CreateTableAsSelect(ctx context.Context, name, sql string, opts *CreateTableOptions) error {
 	if opts == nil {
 		opts = &CreateTableOptions{}
 	}
@@ -51,7 +51,7 @@ func (c *conn) CreateTableAsSelect(ctx context.Context, name string, sql string,
 }
 
 // InsertTableAsSelect inserts the results of the given SQL query into the table.
-func (c *conn) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+func (c *conn) InsertTableAsSelect(ctx context.Context, name, sql string, opts *InsertTableOptions) error {
 	if opts == nil {
 		opts = &InsertTableOptions{
 			Strategy: IncrementalStrategyAppend,
@@ -92,12 +92,12 @@ func (c *singledbConn) Connx() *sqlx.Conn {
 	return c.Conn
 }
 
-func (c *singledbConn) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+func (c *singledbConn) CreateTableAsSelect(ctx context.Context, name, sql string, opts *CreateTableOptions) error {
 	return c.db.createTableAsSelect(ctx, c.Conn, name, sql, opts)
 }
 
 // InsertTableAsSelect inserts the results of the given SQL query into the table.
-func (c *singledbConn) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+func (c *singledbConn) InsertTableAsSelect(ctx context.Context, name, sql string, opts *InsertTableOptions) error {
 	if opts == nil {
 		opts = &InsertTableOptions{
 			Strategy: IncrementalStrategyAppend,

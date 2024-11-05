@@ -141,8 +141,9 @@ func (s *singledb) AcquireWriteConnection(ctx context.Context) (Conn, func() err
 			Conn: c,
 			db:   s,
 		}, func() error {
+			err := c.Close()
 			s.writeMU.Unlock()
-			return c.Close()
+			return err
 		}, nil
 }
 
@@ -165,7 +166,7 @@ func (s *singledb) addTableColumn(ctx context.Context, conn *sqlx.Conn, tableNam
 }
 
 // AlterTableColumn implements DB.
-func (s *singledb) AlterTableColumn(ctx context.Context, tableName string, columnName string, newType string) error {
+func (s *singledb) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
 	s.writeMU.Lock()
 	defer s.writeMU.Unlock()
 
@@ -183,7 +184,7 @@ func (s *singledb) alterTableColumn(ctx context.Context, conn *sqlx.Conn, tableN
 }
 
 // CreateTableAsSelect implements DB.
-func (s *singledb) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+func (s *singledb) CreateTableAsSelect(ctx context.Context, name, uery string, opts *CreateTableOptions) error {
 	s.writeMU.Lock()
 	defer s.writeMU.Unlock()
 
@@ -192,10 +193,10 @@ func (s *singledb) CreateTableAsSelect(ctx context.Context, name string, sql str
 		return err
 	}
 
-	return s.createTableAsSelect(ctx, conn, name, sql, opts)
+	return s.createTableAsSelect(ctx, conn, name, uery, opts)
 }
 
-func (s *singledb) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, name, sql string, opts *CreateTableOptions) error {
+func (s *singledb) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, name, query string, opts *CreateTableOptions) error {
 	var typ string
 	if opts != nil && opts.View {
 		typ = "VIEW"
@@ -203,7 +204,7 @@ func (s *singledb) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, nam
 		typ = "TABLE"
 	}
 
-	_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE %s %s AS (%s\n)", typ, safeSQLName(name), sql))
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE %s %s AS (%s\n)", typ, safeSQLName(name), query))
 	return err
 }
 
@@ -237,7 +238,7 @@ func (s *singledb) dropTable(ctx context.Context, conn *sqlx.Conn, name string) 
 }
 
 // InsertTableAsSelect implements DB.
-func (s *singledb) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+func (s *singledb) InsertTableAsSelect(ctx context.Context, name, query string, opts *InsertTableOptions) error {
 	if opts == nil {
 		opts = &InsertTableOptions{
 			Strategy: IncrementalStrategyAppend,
@@ -256,11 +257,11 @@ func (s *singledb) InsertTableAsSelect(ctx context.Context, name string, sql str
 			Strategy: IncrementalStrategyAppend,
 		}
 	}
-	return execIncrementalInsert(ctx, conn, safeSQLName(name), sql, opts)
+	return execIncrementalInsert(ctx, conn, safeSQLName(name), query, opts)
 }
 
 // RenameTable implements DB.
-func (s *singledb) RenameTable(ctx context.Context, oldName string, newName string) error {
+func (s *singledb) RenameTable(ctx context.Context, oldName, newName string) error {
 	s.writeMU.Lock()
 	defer s.writeMU.Unlock()
 

@@ -13,7 +13,7 @@ import (
 func main() {
 	backup, err := duckdbreplicator.NewGCSBackupProvider(context.Background(), &duckdbreplicator.GCSBackupProviderOptions{
 		UseHostCredentials: true,
-		Bucket:             "gs://<bucket>/",
+		Bucket:             "<my_bucket>",
 		UniqueIdentifier:   "756c6367-e807-43ff-8b07-df1bae29c57e/",
 	})
 	if err != nil {
@@ -57,22 +57,18 @@ func main() {
 		panic(err)
 	}
 
-	t = time.Now()
-	// select count
-	// rows, release, err := db.Query(context.Background(), `SELECT count(*) FROM "test"`)
-	// if err != nil {
-	// 	fmt.Printf("error %v\n", err)
-	// }
-	// defer release()
-	// fmt.Printf("time taken %v\n", time.Since(t))
+	// get count
+	conn, release, err := db.AcquireReadConnection(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	defer release()
 
-	// var count int
-	// for rows.Next() {
-	// 	err = rows.Scan(&count)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	fmt.Println(count)
-	// }
+	var count int
+	err = conn.Connx().QueryRowxContext(context.Background(), `SELECT count(*) FROM "test"`).Scan(&count)
+	if err != nil {
+		fmt.Printf("error %v\n", err)
+	}
+	fmt.Println(count)
 
 }

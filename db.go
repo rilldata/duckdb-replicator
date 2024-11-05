@@ -34,12 +34,11 @@ type DB interface {
 	// AcquireReadConnection returns a connection to the database for reading.
 	// Once done the connection should be released by calling the release function.
 	// This connection must only be used for select queries or for creating and working with temporary tables.
-	// Prefer Query instead of using this method directly for select queries.
 	AcquireReadConnection(ctx context.Context) (conn Conn, release func() error, err error)
 
 	// AcquireWriteConnection returns a connection to the database for writing.
 	// Once done the connection should be released by calling the release function.
-	// Any persistent changes to the database should be done by calling CRUD APIs only.
+	// Any persistent changes to the database should be done by calling CRUD APIs on this connection.
 	AcquireWriteConnection(ctx context.Context) (conn Conn, release func() error, err error)
 
 	// CRUD APIs
@@ -328,6 +327,8 @@ func (d *db) AcquireReadConnection(ctx context.Context) (Conn, func() error, err
 }
 
 func (d *db) AcquireWriteConnection(ctx context.Context) (Conn, func() error, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	c, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -337,14 +338,15 @@ func (d *db) AcquireWriteConnection(ctx context.Context) (Conn, func() error, er
 		Conn: c,
 		db:   d,
 	}, release, nil
-
 }
 
-func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, opts *CreateTableOptions) error {
+func (d *db) CreateTableAsSelect(ctx context.Context, name, query string, opts *CreateTableOptions) error {
 	if opts == nil {
 		opts = &CreateTableOptions{}
 	}
 	d.logger.Info("create table", slog.String("name", name), slog.Bool("view", opts.View))
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
 		return err
@@ -352,10 +354,10 @@ func (d *db) CreateTableAsSelect(ctx context.Context, name string, sql string, o
 	defer func() {
 		_ = release()
 	}()
-	return d.createTableAsSelect(ctx, conn, release, name, sql, opts)
+	return d.createTableAsSelect(ctx, conn, release, name, query, opts)
 }
 
-func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, sql string, opts *CreateTableOptions) error {
+func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, query string, opts *CreateTableOptions) error {
 	// check if some older version exists
 	oldVersion, oldVersionExists, _ := tableVersion(d.writePath, name)
 	d.logger.Info("old version", slog.String("version", oldVersion), slog.Bool("exists", oldVersionExists))
@@ -371,12 +373,12 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 	var m meta
 	if opts.View {
 		// create view - validates that SQL is correct
-		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS (%s\n)", safeSQLName(name), sql))
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS (%s\n)", safeSQLName(name), query))
 		if err != nil {
 			return err
 		}
 
-		m = meta{ViewSQL: sql}
+		m = meta{ViewSQL: query}
 	} else {
 		// create db file
 		dbFile := filepath.Join(newVersionDir, "data.db")
@@ -397,7 +399,7 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 		}
 
 		// ingest data
-		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE TABLE %s.default AS (%s\n)", safeDBName, sql), nil)
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE TABLE %s.default AS (%s\n)", safeDBName, query), nil)
 		if err != nil {
 			_ = os.RemoveAll(newVersionDir)
 			_, _ = conn.ExecContext(ctx, fmt.Sprintf("DETACH DATABASE %s", safeDBName))
@@ -443,7 +445,7 @@ func (d *db) createTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 	return d.syncRead(ctx)
 }
 
-func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, opts *InsertTableOptions) error {
+func (d *db) InsertTableAsSelect(ctx context.Context, name, query string, opts *InsertTableOptions) error {
 	if opts == nil {
 		opts = &InsertTableOptions{
 			Strategy: IncrementalStrategyAppend,
@@ -451,6 +453,8 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 	}
 
 	d.logger.Info("insert table", slog.String("name", name), slog.Group("option", "by_name", opts.ByName, "strategy", string(opts.Strategy), "unique_key", opts.UniqueKey))
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
 		return err
@@ -459,10 +463,10 @@ func (d *db) InsertTableAsSelect(ctx context.Context, name string, sql string, o
 	defer func() {
 		_ = release()
 	}()
-	return d.insertTableAsSelect(ctx, conn, release, name, sql, opts)
+	return d.insertTableAsSelect(ctx, conn, release, name, query, opts)
 }
 
-func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, sql string, opts *InsertTableOptions) error {
+func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseConn func() error, name, query string, opts *InsertTableOptions) error {
 	// Get current table version
 	oldVersion, oldVersionExists, err := tableVersion(d.writePath, name)
 	if err != nil || !oldVersionExists {
@@ -471,7 +475,7 @@ func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 
 	d.writeDirty = true
 	// Execute the insert
-	err = execIncrementalInsert(ctx, conn, fmt.Sprintf("%s.default", safeSQLName(dbName(name))), sql, opts)
+	err = execIncrementalInsert(ctx, conn, fmt.Sprintf("%s.default", safeSQLName(dbName(name))), query, opts)
 	if err != nil {
 		return fmt.Errorf("insert: insert into table %q failed: %w", name, err)
 	}
@@ -511,6 +515,8 @@ func (d *db) insertTableAsSelect(ctx context.Context, conn *sqlx.Conn, releaseCo
 // DropTable implements DB.
 func (d *db) DropTable(ctx context.Context, name string) error {
 	d.logger.Info("drop table", slog.String("name", name))
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	_, release, err := d.acquireWriteConn(ctx) // we don't need the handle but need to sync the write pah
 	if err != nil {
 		return err
@@ -550,7 +556,8 @@ func (d *db) RenameTable(ctx context.Context, oldName, newName string) error {
 	if strings.EqualFold(oldName, newName) {
 		return fmt.Errorf("rename: Table with name %q already exists", newName)
 	}
-
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	_, release, err := d.acquireWriteConn(ctx) // we don't need the handle but need to sync the write
 	if err != nil {
 		return err
@@ -622,6 +629,8 @@ func (d *db) renameTable(ctx context.Context, oldName, newName string) error {
 
 func (d *db) AddTableColumn(ctx context.Context, tableName, columnName, typ string) error {
 	d.logger.Info("AddTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", typ))
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
 		return err
@@ -679,6 +688,8 @@ func (d *db) addTableColumn(ctx context.Context, conn *sqlx.Conn, releaseConn fu
 // AlterTableColumn implements drivers.OLAPStore.
 func (d *db) AlterTableColumn(ctx context.Context, tableName, columnName, newType string) error {
 	d.logger.Info("AlterTableColumn", slog.String("table", tableName), slog.String("column", columnName), slog.String("typ", newType))
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	conn, release, err := d.acquireWriteConn(ctx)
 	if err != nil {
 		return err
@@ -769,7 +780,6 @@ func (d *db) syncRead(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-
 	}
 
 	// delete data for tables that have been removed from write
@@ -815,34 +825,26 @@ func (d *db) syncRead(ctx context.Context) error {
 }
 
 // acquireWriteConn syncs the write database, initializes the write handle and returns a write connection.
+// The release function should be called to release the connection.
+// It should be called with the writeMu locked.
 func (d *db) acquireWriteConn(ctx context.Context) (*sqlx.Conn, func() error, error) {
-	d.writeMu.Lock()
 	err := d.syncWrite(ctx)
 	if err != nil {
-		d.writeMu.Unlock()
 		return nil, nil, err
 	}
 
 	db, err := d.openDBAndAttach(ctx, d.writePath, d.opts.WriteSettings, false)
 	if err != nil {
-		d.writeMu.Unlock()
 		return nil, nil, err
 	}
 	conn, err := db.Connx(ctx)
 	if err != nil {
 		_ = db.Close()
-		d.writeMu.Unlock()
 		return nil, nil, err
 	}
-	release := false
 	return conn, func() error {
-		if release { // make release idempotent
-			return nil
-		}
 		_ = conn.Close()
 		err = db.Close()
-		d.writeMu.Unlock()
-		release = true
 		return err
 	}, nil
 }
@@ -983,7 +985,7 @@ func (d *db) attachDBs(ctx context.Context, db *sqlx.DB, path string, read bool)
 			views = append(views, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS (%s\n)", safeSQLName(entry.Name()), meta.ViewSQL))
 			continue
 		}
-		switch BackupFormat(meta.Format) {
+		switch meta.Format {
 		case BackupFormatDB:
 			dbName := dbName(entry.Name())
 			var readMode string
@@ -1025,21 +1027,21 @@ func (d *db) writeTableVersion(name string) (string, bool, error) {
 	return tableVersion(d.writePath, name)
 }
 
-func execIncrementalInsert(ctx context.Context, conn *sqlx.Conn, safeTableName, sql string, opts *InsertTableOptions) error {
+func execIncrementalInsert(ctx context.Context, conn *sqlx.Conn, safeTableName, query string, opts *InsertTableOptions) error {
 	var byNameClause string
 	if opts.ByName {
 		byNameClause = "BY NAME"
 	}
 
 	if opts.Strategy == IncrementalStrategyAppend {
-		_, err := conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s (%s\n)", safeTableName, byNameClause, sql))
+		_, err := conn.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s %s (%s\n)", safeTableName, byNameClause, query))
 		return err
 	}
 
 	if opts.Strategy == IncrementalStrategyMerge {
 		// Create a temporary table with the new data
 		tmp := uuid.New().String()
-		_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE TEMPORARY TABLE %s AS (%s\n)", safeSQLName(tmp), sql))
+		_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE TEMPORARY TABLE %s AS (%s\n)", safeSQLName(tmp), query))
 		if err != nil {
 			return err
 		}
