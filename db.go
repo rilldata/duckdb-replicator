@@ -41,6 +41,10 @@ type DB interface {
 	// Any persistent changes to the database should be done by calling CRUD APIs on this connection.
 	AcquireWriteConnection(ctx context.Context) (conn Conn, release func() error, err error)
 
+	// Size returns the size of the database in bytes.
+	// It is currently implemented as sum of the size of all serving `.db` files.
+	Size() int64
+
 	// CRUD APIs
 
 	// CreateTableAsSelect creates a new table by name from the results of the given SQL query.
@@ -272,9 +276,19 @@ func NewDB(ctx context.Context, dbIdentifier string, opts *DBOptions) (DB, error
 	// create read handle
 	db.readHandle, err = db.openDBAndAttach(ctx, true)
 	if err != nil {
+		// Check for using incompatible database files
+		if strings.Contains(err.Error(), "Trying to read a database file with version number") {
+			return nil, fmt.Errorf("database file was created with an older, incompatible version of Rill (please remove `tmp` directory and try again)")
+		}
+
 		// Check for another process currently accessing the DB
 		if strings.Contains(err.Error(), "Could not set lock on file") {
 			return nil, fmt.Errorf("failed to open database (is Rill already running?): %w", err)
+		}
+
+		if strings.Contains(err.Error(), "Symbol not found") {
+			fmt.Printf("Your version of macOS is not supported. Please upgrade to the latest major release of macOS. See this link for details: https://support.apple.com/en-in/macos/upgrade")
+			os.Exit(1)
 		}
 		return nil, err
 	}
@@ -828,6 +842,32 @@ func (d *db) syncRead(ctx context.Context) error {
 	return nil
 }
 
+func (d *db) Size() int64 {
+	var paths []string
+	entries, err := os.ReadDir(d.readPath)
+	if err != nil { // ignore error
+		return 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// this is to avoid counting temp tables during source ingestion
+		// in certain cases we only want to compute the size of the serving db files
+		// TODO :: remove this when removing staged table concepts
+		if strings.HasPrefix(entry.Name(), "__rill_tmp_") {
+			continue
+		}
+		path := filepath.Join(d.readPath, entry.Name())
+		version, exist, _ := d.readTableVersion(entry.Name())
+		if !exist {
+			continue
+		}
+		paths = append(paths, filepath.Join(path, fmt.Sprintf("%s.db", version)))
+	}
+	return fileSize(paths)
+}
+
 // acquireWriteConn syncs the write database, initializes the write handle and returns a write connection.
 // The release function should be called to release the connection.
 // It should be called with the writeMu locked.
@@ -893,16 +933,6 @@ func (d *db) openDBAndAttach(ctx context.Context, read bool) (*sqlx.DB, error) {
 		return nil
 	})
 	if err != nil {
-		// Check for using incompatible database files
-		if strings.Contains(err.Error(), "Trying to read a database file with version number") {
-			return nil, fmt.Errorf("database file was created with an older, incompatible version of Rill (please remove `tmp` directory and try again)")
-		}
-
-		// Check for another process currently accessing the DB
-		if strings.Contains(err.Error(), "Could not set lock on file") {
-			return nil, fmt.Errorf("failed to open database (is Rill already running?): %w", err)
-		}
-
 		return nil, err
 	}
 

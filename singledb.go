@@ -302,6 +302,11 @@ func (s *singledb) alterTableColumn(ctx context.Context, conn *sqlx.Conn, tableN
 	return err
 }
 
+// TODO :: fix by calling pragma_database_size
+func (s *singledb) Size() int64 {
+	return 0
+}
+
 func isView(ctx context.Context, conn *sqlx.Conn, name string) (bool, error) {
 	var view bool
 	err := conn.QueryRowxContext(ctx, `

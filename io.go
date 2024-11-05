@@ -63,3 +63,13 @@ func copyFile(dst, src string) error {
 	}
 	return nil
 }
+
+func fileSize(paths []string) int64 {
+	var size int64
+	for _, path := range paths {
+		if info, err := os.Stat(path); err == nil { // ignoring error since only error possible is *PathError
+			size += info.Size()
+		}
+	}
+	return size
+}
